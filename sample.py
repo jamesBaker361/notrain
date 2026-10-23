@@ -1,6 +1,7 @@
 '''
 sample text-conditioned smoothed CFDM from a bank built by embed.py
-usage: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompts "a smiling woman" "a man with a beard" --w 0 1 4
+usage: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompt_file prompts/faces.txt --w 0 1 4
+   or: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompts "a smiling woman" "a man with a beard" --w 0 1 4
 each output row is: [top CLIP-retrieved training image | samples...] for one (prompt, w)
 '''
 import os
@@ -18,7 +19,8 @@ from bank import load_clip,encode_texts_clip,encode_images_clip,load_vae,bank_to
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--bank",type=str,default="banks/celeb_vae_256.pt")
-parser.add_argument("--prompts",type=str,nargs="+",default=["a smiling woman with blonde hair","a man with a beard and glasses"])
+parser.add_argument("--prompt_file",type=str,default="prompts/faces.txt",help="one prompt per line; blank lines are skipped")
+parser.add_argument("--prompts",type=str,nargs="+",default=None,help="overrides --prompt_file")
 parser.add_argument("--n_per_prompt",type=int,default=8)
 parser.add_argument("--w",type=float,nargs="+",default=[0.0,1.0,4.0],help="text guidance weights to sweep; 0=unconditional, 1=exact conditional")
 parser.add_argument("--sigma",type=float,default=0.25,help="smoothing, as a fraction of the median pairwise distance between bank points; 0 reproduces training points exactly")
@@ -41,16 +43,23 @@ def main(args):
     T=bank["T"].to(device)
     print(f"bank {args.bank}: X {tuple(X.shape)} T {tuple(T.shape)} space {bank['space']} shape {bank['shape']}")
 
+    if args.prompts is not None:
+        prompts=args.prompts
+    else:
+        with open(args.prompt_file,"r") as file:
+            prompts=[line.strip() for line in file if line.strip()]
+    print("prompts",prompts)
+
     if not args.no_wandb:
         wandb.init(project=args.project_name,config=vars(args))
 
     clip_model,clip_processor=load_clip(bank["clip_model"],device)
     vae=load_vae(bank["vae"],device) if bank["space"]=="vae" else None
-    text_embeds=encode_texts_clip(clip_model,clip_processor,args.prompts,device)
+    text_embeds=encode_texts_clip(clip_model,clip_processor,prompts,device)
     log_priors=text_log_prior(text_embeds,T,bank["logit_scale"])
     if args.eval_clip_model:
         eval_model,eval_processor=load_clip(args.eval_clip_model,device)
-        eval_text_embeds=encode_texts_clip(eval_model,eval_processor,args.prompts,device)
+        eval_text_embeds=encode_texts_clip(eval_model,eval_processor,prompts,device)
     else:
         eval_model,eval_processor,eval_text_embeds=clip_model,clip_processor,text_embeds
 
@@ -64,7 +73,7 @@ def main(args):
 
     os.makedirs(args.output_dir,exist_ok=True)
     results=[]
-    for p,prompt in enumerate(args.prompts):
+    for p,prompt in enumerate(prompts):
         name=re.sub(r"[^A-Za-z0-9]+","_",prompt).strip("_")[:60]
         X_sub,log_prior,idx=top_k_subset(X,log_priors[p],args.top_k)
         retrieved=to_pil(bank_to_pixels(bank,X[idx[:1]],vae))[0]
@@ -107,7 +116,7 @@ def main(args):
         grid.save(os.path.join(args.output_dir,f"{p}_{name}.png"))
 
     with open(os.path.join(args.output_dir,"metrics.json"),"w") as f:
-        json.dump({"args":vars(args),"results":results},f,indent=4)
+        json.dump({"args":vars(args),"prompts":prompts,"results":results},f,indent=4)
     print(f"saved grids and metrics to {args.output_dir}")
     if not args.no_wandb:
         wandb.finish()

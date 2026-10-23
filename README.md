@@ -23,7 +23,7 @@ Since $c$ is fixed for a whole trajectory, the text prior is computed once per p
 - `cfdm.py`: the sampler (pure torch).
 - `bank.py`: CLIP and VAE encode/decode helpers.
 - `embed.py`: builds a bank: `X` (flattened pixels or SD-VAE latents) and `T` (normalized CLIP image embeddings).
-- `sample.py`: samples for a list of prompts and a sweep over `w`. It saves image grids, where each row is the top CLIP-retrieved training image followed by the samples, and writes `metrics.json` with CLIP score, copy rate and nearest-neighbour distance.
+- `sample.py`: samples for each prompt in `--prompt_file` (one per line; `--prompts` overrides it) and a sweep over `w`. It saves image grids, where each row is the top CLIP-retrieved training image followed by the samples, and writes `metrics.json` with CLIP score, copy rate and nearest-neighbour distance.
 - `test_cfdm.py`: checks the score against autograd of the conditional mixture, plus the limits in `w`, top-k and sampling.
 
 ## Usage
@@ -31,7 +31,7 @@ Since $c$ is fixed for a whole trajectory, the text prior is computed once per p
 ```bash
 git submodule update --init
 sbatch runpygpu_chip.sh embed.py --dataset jlbaker361/celeb --space vae --resolution 256 --save_path banks/celeb_vae_256.pt
-sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompts "a smiling woman with blonde hair" "a man with a beard" --w 0 1 4 --sigma 0.25
+sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompt_file prompts/faces.txt --w 0 1 4 --sigma 0.25
 python -m pytest test_cfdm.py
 ```
 
