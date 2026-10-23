@@ -3,6 +3,7 @@ sample text-conditioned smoothed CFDM from a bank built by embed.py
 usage: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompt_file prompts/faces.txt --w 0 1 4
    or: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompts "a smiling woman" "a man with a beard" --w 0 1 4
 each output row is: [top CLIP-retrieved training image | samples...] for one (prompt, w)
+--scales 1 2 4 turns on multiscale patches: whole image, quarters and 16ths, blended over time by --schedule
 '''
 import os
 import re
@@ -14,7 +15,7 @@ import wandb
 import numpy as np
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
-from cfdm import text_log_prior,top_k_subset,sample
+from cfdm import text_log_prior,top_k_subset,sample,sample_multiscale,median_patch_distance
 from bank import load_clip,encode_texts_clip,encode_images_clip,load_vae,bank_to_pixels,to_pil
 
 parser=argparse.ArgumentParser()
@@ -28,6 +29,11 @@ parser.add_argument("--M",type=int,default=4,help="noise samples per smoothed sc
 parser.add_argument("--steps",type=int,default=50)
 parser.add_argument("--start_t",type=float,default=0.2,help="start from the exact mixture at this t (0 = pure noise)")
 parser.add_argument("--top_k",type=int,default=1000,help="restrict to the top-k CLIP matches per prompt (<=0 for all); w=0 always uses the full bank")
+parser.add_argument("--scales",type=int,nargs="+",default=[1],help="patch grid sizes, coarse to fine, e.g. 1 2 4 = whole, quarters, 16ths")
+parser.add_argument("--patch_sigma",type=float,default=0.0,help="smoothing at the patch scales (>1), as a fraction of the median patch distance at that scale; --sigma applies to the whole-image scale")
+parser.add_argument("--patch_positions",type=str,default="any",choices=["any","same"],help="whether a region can draw patches from every grid position or only its own")
+parser.add_argument("--schedule",type=str,default="coarse_to_fine",choices=["coarse_to_fine","fine_to_coarse","constant"])
+parser.add_argument("--scale_weights",type=float,nargs="+",default=None,help="per-scale weights for --schedule constant")
 parser.add_argument("--copy_threshold",type=float,default=1e-2,help="relative distance below which a sample counts as a training copy")
 parser.add_argument("--eval_clip_model",type=str,default="",help="CLIP used for the clip_score metric; defaults to the conditioning CLIP (biased)")
 parser.add_argument("--seed",type=int,default=123)
@@ -63,13 +69,16 @@ def main(args):
     else:
         eval_model,eval_processor,eval_text_embeds=clip_model,clip_processor,text_embeds
 
-    # typical distance between training points over the whole bank: sets the smoothing scale and the copy metric
+    if args.schedule=="constant":
+        assert args.scale_weights is not None and len(args.scale_weights)==len(args.scales),"--schedule constant needs one --scale_weights per scale"
+
+    # typical distance between bank points (and between patches at each scale) over the whole bank:
+    # sets the smoothing per scale; the scale-1 value also normalizes the copy metric
     generator=torch.Generator(device=device).manual_seed(args.seed)
-    probe=X[torch.randperm(X.shape[0],generator=generator,device=device)[:512]]
-    pair=torch.cdist(probe,probe)
-    scale=pair[pair>0].median().item()
+    scale=median_patch_distance(X,bank["shape"],1,generator=generator)
+    sigmas=[(args.sigma if s==1 else args.patch_sigma)*median_patch_distance(X,bank["shape"],s,generator=generator) for s in args.scales]
     sigma=args.sigma*scale
-    print(f"median pairwise distance {scale:.4f}, sigma {sigma:.4f}")
+    print(f"median pairwise distance {scale:.4f}, sigma {sigma:.4f}, per-scale sigmas {dict(zip(args.scales,sigmas))}")
 
     os.makedirs(args.output_dir,exist_ok=True)
     results=[]
@@ -89,8 +98,13 @@ def main(args):
                 if prior_mass<0.9:
                     print(f"warning: top_k={args.top_k} keeps only {prior_mass:.3f} of the prior mass for '{prompt}' at w={w}")
             start=time.time()
-            out=sample(args.n_per_prompt,X_w,log_prior_w,w=w,sigma=sigma,M=args.M,
-                       steps=args.steps,start_t=args.start_t,generator=generator)
+            if args.scales==[1]:
+                out=sample(args.n_per_prompt,X_w,log_prior_w,w=w,sigma=sigma,M=args.M,
+                           steps=args.steps,start_t=args.start_t,generator=generator)
+            else:
+                out=sample_multiscale(args.n_per_prompt,X_w,bank["shape"],args.scales,log_prior_w,w=w,sigmas=sigmas,M=args.M,
+                                      steps=args.steps,start_t=args.start_t,schedule=args.schedule,
+                                      constant_weights=args.scale_weights,positions=args.patch_positions,generator=generator)
             if device=="cuda":
                 torch.cuda.synchronize()
             elapsed=time.time()-start

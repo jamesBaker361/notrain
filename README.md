@@ -37,6 +37,14 @@ python -m pytest test_cfdm.py
 
 `--sigma` is a fraction of the median pairwise distance between bank points. At about 0.1 or below, samples are copies of training images. From about 0.25 up, samples are barycenters of M-tuples of training points.
 
+## Multiscale patches
+
+`--scales 1 2 4` cuts each latent into a 1×1, 2×2 and 4×4 grid. Each patch region gets its own closed-form k_t over patches from the CLIP-retrieved images, with each patch keeping its parent image's text prior. The per-scale k_t's are blended over time by `--schedule` (`coarse_to_fine` by default, with linear hat weights), so different regions can come from different images. This is a local-score heuristic: only scale 1 is the exact score of a distribution.
+
+- `--patch_positions any|same`: whether a region can take patches from every grid position or only its own. On CelebA, `any` scrambles faces (about half of the patches come from a different position), while `same` gives aligned collages.
+- `--sigma` smooths only the whole-image scale. `--patch_sigma` (default 0) smooths the patch scales. Smoothing at the patch scales averages several patches together and turns the image to mush, so leaving it at 0 makes each region snap to one real, sharp patch.
+- `--start_t` matters a lot here. At 0.2 the sample has already locked onto one image before the patch scales take over, so you mostly get copies. At 0 you get real collages.
+
 ## Caveats
 
 - Samples are still combinations of training points, now chosen by the text. Prompts that nothing in the dataset matches can't be produced.
