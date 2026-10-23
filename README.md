@@ -43,7 +43,7 @@ python -m pytest test_cfdm.py
 
 - `--patch_positions any|same`: whether a region can take patches from every grid position or only its own. On CelebA, `any` scrambles faces (about half of the patches come from a different position), while `same` gives aligned collages.
 - `--sigma` smooths only the whole-image scale. `--patch_sigma` (default 0) smooths the patch scales. Smoothing at the patch scales averages several patches together and turns the image to mush, so leaving it at 0 makes each region snap to one real, sharp patch.
-- `--start_t` matters a lot here. At 0.2 the sample has already locked onto one image before the patch scales take over, so you mostly get copies. At 0 you get real collages.
+- The start at `start_t` comes from whichever scale has the most weight at that moment. If that's scale 1, one whole image is noised, and by about t=0.2 the sample has locked onto it, so later patch scales just reassemble that image. If it's a patch scale (for example `--scales 2 4`), each region starts from its own patch, so samples mix images at any `start_t`.
 
 ## Caveats
 

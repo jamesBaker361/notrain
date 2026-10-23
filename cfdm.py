@@ -240,6 +240,28 @@ def median_patch_distance(X:torch.Tensor,shape:tuple,s:int,n_probe:int=512,gener
     return pair[pair>0].median().item()
 
 
+def patch_initial_sample(n:int,bank:dict,start_t:float,w:float=1.0,generator:torch.Generator=None)->torch.Tensor:
+    '''
+    exact sample from the patch mixture of one scale at start_t: every region picks its own patch
+    (by the parent prior), so regions don't all start from the same whole image
+    '''
+    s,shape,patches=bank["s"],bank["shape"],bank["patches"]
+    R=s*s
+    N,P=patches.shape[0],patches.shape[-1]
+    if bank["log_prior"] is None or w==0:
+        probs=torch.full((N,),1.0/N,device=patches.device)
+    else:
+        probs=torch.softmax(w*bank["log_prior"].float(),dim=-1)
+    idx=torch.multinomial(probs,n*R,replacement=True,generator=generator).reshape(n,R)
+    if bank["positions"]=="same":
+        chosen=patches[idx,torch.arange(R,device=patches.device).expand(n,-1)]
+    else:
+        chosen=patches[idx]
+    x=unpatchify(chosen.reshape(n,R,P),shape,s)
+    noise=torch.randn(x.shape,generator=generator,device=x.device,dtype=x.dtype)
+    return start_t*x+(1-start_t)*noise
+
+
 @torch.no_grad()
 def sample_multiscale(n:int,X:torch.Tensor,shape:tuple,scales:list=(1,2,4),log_prior:torch.Tensor=None,w:float=1.0,
                       sigmas:list=None,M:int=1,steps:int=50,start_t:float=0.0,schedule:str="coarse_to_fine",
@@ -248,7 +270,8 @@ def sample_multiscale(n:int,X:torch.Tensor,shape:tuple,scales:list=(1,2,4),log_p
     same Euler scheme as sample(), with k_t replaced by the scale-blended patch k_t
     X: (N,D) bank images (e.g. the top-k CLIP matches), shape: (C,H,W), sigmas: absolute smoothing per scale
     positions: "any" lets a region draw patches from every grid position, "same" only from its own
-    the initial whole-image pick at start_t still uses the CLIP prior
+    the start at start_t is drawn from whichever scale has the most weight then: a whole image picked by
+    the CLIP prior for scale 1, otherwise an independent prior-weighted patch per region
     '''
     assert 0<=start_t<1,"start_t must be in [0,1)"
     banks=[]
@@ -259,7 +282,12 @@ def sample_multiscale(n:int,X:torch.Tensor,shape:tuple,scales:list=(1,2,4),log_p
         else:
             patches,patch_prior=patch_bank(X,shape,s,log_prior)
         banks.append({"s":s,"shape":shape,"positions":positions,"patches":patches,"log_prior":patch_prior,"x_sq":patches.pow(2).sum(-1)})
-    z=initial_sample(n,X,start_t,log_prior,w,generator)
+    start_alphas=scale_weights(start_t,len(scales),schedule,start_t,constant_weights)
+    start_bank=banks[max(range(len(scales)),key=lambda j:start_alphas[j])]
+    if start_bank["s"]==1:
+        z=initial_sample(n,X,start_t,log_prior,w,generator)
+    else:
+        z=patch_initial_sample(n,start_bank,start_t,w,generator)
     ts=torch.linspace(start_t,1.0,steps+1).tolist()
     if ts[0]==0:
         ts[0]=1e-4

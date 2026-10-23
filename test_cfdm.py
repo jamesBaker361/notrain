@@ -209,3 +209,16 @@ def test_same_position_k_t_matches_per_region_k_t(image_setup):
     z_p=patchify(z,SHAPE,2)
     for j in range(4):
         assert torch.allclose(out[:,j],k_t(z_p[:,j],patches[:,j],0.4,log_prior,w=1.5),atol=1e-12)
+
+
+@pytest.mark.parametrize("positions",["any","same"])
+def test_patch_scales_start_from_independent_patches(image_setup,positions):
+    # without scale 1 each region starts from its own patch, so a late start still mixes images
+    X,T,c,g=image_setup
+    out=sample_multiscale(8,X,SHAPE,scales=[2,4],steps=100,start_t=0.9,positions=positions,generator=g)
+    cand,_=patch_bank(X,SHAPE,2)
+    _,nearest=torch.cdist(patchify(out,SHAPE,2).reshape(-1,32),cand).min(-1)
+    parents=(nearest//4).reshape(8,4)
+    assert max(len(set(row.tolist())) for row in parents)>1
+    if positions=="same":
+        assert torch.equal((nearest%4).reshape(8,4),torch.arange(4).expand(8,-1))
