@@ -2,6 +2,7 @@ import math
 import torch
 import pytest
 from cfdm import text_log_prior,top_k_subset,k_t,score,velocity,initial_sample,sample
+from cfdm import patchify,unpatchify,patch_bank,scale_weights,multiscale_k_t,sample_multiscale
 
 
 def mixture_log_density(z,X,t,log_prior):
@@ -102,3 +103,109 @@ def test_smoothing_leaves_training_set(setup):
     out=sample(16,X,None,sigma=1.0,M=4,steps=100,start_t=0.2,generator=g)
     assert torch.isfinite(out).all()
     assert (torch.cdist(out,X).min(-1).values>1e-3).any()
+
+
+SHAPE=(2,8,8)
+
+
+@pytest.fixture
+def image_setup():
+    g=torch.Generator().manual_seed(1)
+    N=12
+    X=torch.randn(N,2*8*8,generator=g,dtype=torch.float64)
+    T=torch.nn.functional.normalize(torch.randn(N,5,generator=g,dtype=torch.float64),dim=-1)
+    c=torch.nn.functional.normalize(torch.randn(5,generator=g,dtype=torch.float64),dim=-1)
+    return X,T,c,g
+
+
+@pytest.mark.parametrize("s",[1,2,4])
+def test_patchify_roundtrip(image_setup,s):
+    X,T,c,g=image_setup
+    assert torch.equal(unpatchify(patchify(X,SHAPE,s),SHAPE,s),X)
+
+
+def test_patchify_grid_order(image_setup):
+    X,T,c,g=image_setup
+    img=X.reshape(-1,*SHAPE)
+    p=patchify(X,SHAPE,2)
+    # patch 1 is the top-right quarter, patch 2 the bottom-left
+    assert torch.equal(p[:,1],img[:,:,:4,4:].reshape(X.shape[0],-1))
+    assert torch.equal(p[:,2],img[:,:,4:,:4].reshape(X.shape[0],-1))
+
+
+def test_patch_prior_inherits_parent(image_setup):
+    X,T,c,g=image_setup
+    log_prior=text_log_prior(c,T,10.0)
+    patches,patch_prior=patch_bank(X,SHAPE,4,log_prior)
+    assert patches.shape==(X.shape[0]*16,8)
+    # each image keeps its total prior mass, split evenly over its 16 patches
+    assert torch.allclose(patch_prior.exp().reshape(-1,16).sum(-1),log_prior.exp())
+
+
+def test_scale_weights_schedule():
+    assert scale_weights(0.2,3,"coarse_to_fine",0.2)==[1.0,0.0,0.0]
+    assert scale_weights(1.0,3,"coarse_to_fine",0.2)==[0.0,0.0,1.0]
+    assert scale_weights(0.6,3,"coarse_to_fine",0.2)==pytest.approx([0.0,1.0,0.0])
+    assert scale_weights(0.2,3,"fine_to_coarse",0.2)==[0.0,0.0,1.0]
+    assert scale_weights(0.5,3,"constant",constant=[2,1,1])==[0.5,0.25,0.25]
+    for t in [0.25,0.4,0.77,0.95]:
+        assert sum(scale_weights(t,3,"coarse_to_fine",0.2))==pytest.approx(1.0)
+
+
+def test_scale_one_matches_whole_image(image_setup):
+    X,T,c,g=image_setup
+    log_prior=text_log_prior(c,T,10.0)
+    z=torch.randn(3,X.shape[1],generator=g,dtype=torch.float64)
+    patches,patch_prior=patch_bank(X,SHAPE,1,log_prior)
+    bank={"s":1,"shape":SHAPE,"patches":patches,"log_prior":patch_prior,"x_sq":patches.pow(2).sum(-1)}
+    assert torch.allclose(multiscale_k_t(z,[bank],0.5,[1.0],w=2.0),k_t(z,X,0.5,log_prior,w=2.0),atol=1e-12)
+
+
+def test_finest_scale_makes_collages(image_setup):
+    # with sigma=0 and only 16ths, every output patch is some training patch (from any position),
+    # and a sample generally mixes patches from several images
+    X,T,c,g=image_setup
+    out=sample_multiscale(8,X,SHAPE,scales=[4],steps=200,start_t=0.2,generator=g)
+    patches,_=patch_bank(X,SHAPE,4)
+    out_p=patchify(out,SHAPE,4).reshape(-1,8)
+    d,nearest=torch.cdist(out_p,patches).min(-1)
+    assert (d<1e-3).all()
+    parents=(nearest//16).reshape(8,16)
+    assert max(len(set(row.tolist())) for row in parents)>1
+
+
+def test_multiscale_one_scale_equals_sample(image_setup):
+    X,T,c,g=image_setup
+    log_prior=text_log_prior(c,T,10.0)
+    a=sample(4,X,log_prior,w=1.0,steps=30,start_t=0.2,generator=torch.Generator().manual_seed(5))
+    b=sample_multiscale(4,X,SHAPE,scales=[1],log_prior=log_prior,w=1.0,steps=30,start_t=0.2,generator=torch.Generator().manual_seed(5))
+    assert torch.allclose(a,b,atol=1e-10)
+
+
+def test_same_position_matches_any_with_one_scale(image_setup):
+    X,T,c,g=image_setup
+    log_prior=text_log_prior(c,T,10.0)
+    a=sample_multiscale(4,X,SHAPE,scales=[1],log_prior=log_prior,steps=30,start_t=0.2,positions="any",generator=torch.Generator().manual_seed(5))
+    b=sample_multiscale(4,X,SHAPE,scales=[1],log_prior=log_prior,steps=30,start_t=0.2,positions="same",generator=torch.Generator().manual_seed(5))
+    assert torch.allclose(a,b,atol=1e-10)
+
+
+def test_same_position_keeps_positions(image_setup):
+    X,T,c,g=image_setup
+    out=sample_multiscale(8,X,SHAPE,scales=[4],steps=200,start_t=0.0,positions="same",generator=g)
+    cand,_=patch_bank(X,SHAPE,4)
+    d,nearest=torch.cdist(patchify(out,SHAPE,4).reshape(-1,8),cand).min(-1)
+    assert (d<1e-3).all()
+    assert torch.equal((nearest%16).reshape(8,16),torch.arange(16).expand(8,-1))
+
+
+def test_same_position_k_t_matches_per_region_k_t(image_setup):
+    X,T,c,g=image_setup
+    log_prior=text_log_prior(c,T,10.0)
+    z=torch.randn(3,X.shape[1],generator=g,dtype=torch.float64)
+    patches=patchify(X,SHAPE,2)
+    bank={"s":2,"shape":SHAPE,"positions":"same","patches":patches,"log_prior":log_prior,"x_sq":patches.pow(2).sum(-1)}
+    out=patchify(multiscale_k_t(z,[bank],0.4,[1.0],w=1.5),SHAPE,2)
+    z_p=patchify(z,SHAPE,2)
+    for j in range(4):
+        assert torch.allclose(out[:,j],k_t(z_p[:,j],patches[:,j],0.4,log_prior,w=1.5),atol=1e-12)
