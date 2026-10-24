@@ -45,6 +45,23 @@ python -m pytest test_cfdm.py
 - `--sigma` smooths only the whole-image scale. `--patch_sigma` (default 0) smooths the patch scales. Smoothing at the patch scales averages several patches together and turns the image to mush, so leaving it at 0 makes each region snap to one real, sharp patch.
 - The start at `start_t` comes from whichever scale has the most weight at that moment. If that's scale 1, one whole image is noised, and by about t=0.2 the sample has locked onto it, so later patch scales just reassemble that image. If it's a patch scale (for example `--scales 2 4`), each region starts from its own patch, so samples mix images at any `start_t`.
 
+## CLIP tree
+
+`tree.py` builds a hierarchical index over a bank. It runs PCA on the CLIP image embeddings (`--pca_dim`), then recursive k-means in that space, with k fixed (`--branching 10`) or picked per node by silhouette score (`--branching silhouette`). Nodes with `--c_build` or fewer images get one leaf per image. Each node stores its mean CLIP embedding, and each internal node also stores the per-dimension mean and variance of its members' VAE latents.
+
+`sample.py --method tree --tree <path>` walks down the tree, picking a child with probability softmax(w · logit_scale · mean CLIP similarity to the prompt). So w=0 is a uniform random walk, w=1 uses CLIP's own temperature, and large w is greedy. The walk stops at depth `--tree_depth` or at the first node with `--c_search` or fewer images, then samples from that node using `--node_sampler`:
+
+- `diagonal`: N(mean, diag var). Dimensions are sampled independently, which decodes to speckle noise.
+- `lowrank` (default): mean + Σ_i a_i (x_i − mean)/√(n−1) with a ~ N(0, I). It has the same per-dimension variance as `diagonal`, but keeps the correlations between dimensions, which gives coherent new faces.
+- `cfdm`: smoothed CFDM over the node's members (uses `--sigma`, `--M`, `--steps`, `--start_t`).
+
+A walk that ends on a single-image leaf just returns that image. On macOS, run `tree.py` with `OMP_NUM_THREADS=1`; otherwise sklearn and torch can load clashing OpenMP runtimes and segfault.
+
+```bash
+sbatch runpygpu_chip.sh tree.py --bank banks/celeb.pt --save_path banks/celeb_tree.pt --branching silhouette
+sbatch runpygpu_chip.sh sample.py --bank banks/celeb.pt --method tree --tree banks/celeb_tree.pt --node_sampler lowrank --prompt_file prompts/celeb.txt --w 0 1 4
+```
+
 ## Caveats
 
 - Samples are still combinations of training points, now chosen by the text. Prompts that nothing in the dataset matches can't be produced.

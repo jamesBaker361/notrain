@@ -17,6 +17,7 @@ from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from cfdm import text_log_prior,top_k_subset,sample,sample_multiscale,median_patch_distance
 from bank import load_clip,encode_texts_clip,encode_images_clip,load_vae,bank_to_pixels,to_pil
+from tree import tree_sample,node_size
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--bank",type=str,default="banks/celeb_vae_256.pt")
@@ -34,6 +35,11 @@ parser.add_argument("--patch_sigma",type=float,default=0.0,help="smoothing at th
 parser.add_argument("--patch_positions",type=str,default="any",choices=["any","same"],help="whether a region can draw patches from every grid position or only its own")
 parser.add_argument("--schedule",type=str,default="coarse_to_fine",choices=["coarse_to_fine","fine_to_coarse","constant"])
 parser.add_argument("--scale_weights",type=float,nargs="+",default=None,help="per-scale weights for --schedule constant")
+parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","tree"],help="tree: descend a CLIP tree built by tree.py, then sample from the node")
+parser.add_argument("--tree",type=str,default="",help="tree built by tree.py for this bank")
+parser.add_argument("--tree_depth",type=int,default=5,help="stop the descent at this depth (L)")
+parser.add_argument("--c_search",type=int,default=20,help="stop the descent at the first node with this many images or fewer")
+parser.add_argument("--node_sampler",type=str,default="lowrank",choices=["diagonal","lowrank","cfdm"],help="how to sample from the stopping node; cfdm uses --sigma, --M, --steps, --start_t")
 parser.add_argument("--copy_threshold",type=float,default=1e-2,help="relative distance below which a sample counts as a training copy")
 parser.add_argument("--eval_clip_model",type=str,default="",help="CLIP used for the clip_score metric; defaults to the conditioning CLIP (biased)")
 parser.add_argument("--seed",type=int,default=123)
@@ -69,6 +75,11 @@ def main(args):
     else:
         eval_model,eval_processor,eval_text_embeds=clip_model,clip_processor,text_embeds
 
+    if args.method=="tree":
+        assert args.tree,"--method tree needs --tree"
+        tree=torch.load(args.tree,weights_only=False)
+        assert tree["n"]==X.shape[0],f"tree was built for {tree['n']} images but the bank has {X.shape[0]}"
+
     if args.schedule=="constant":
         assert args.scale_weights is not None and len(args.scale_weights)==len(args.scales),"--schedule constant needs one --scale_weights per scale"
 
@@ -98,7 +109,15 @@ def main(args):
                 if prior_mass<0.9:
                     print(f"warning: top_k={args.top_k} keeps only {prior_mass:.3f} of the prior mass for '{prompt}' at w={w}")
             start=time.time()
-            if args.scales==[1]:
+            nodes=None
+            if args.method=="tree":
+                # w sets the descent sharpness (0 = uniform random walk), so no top-k subset is used
+                prior_mass=None
+                out,nodes=tree_sample(tree,X,text_embeds[p],args.n_per_prompt,w,bank["logit_scale"],args.tree_depth,
+                                      args.c_search,args.node_sampler,generator,
+                                      cfdm_kwargs={"log_prior":log_priors[p],"w":w,"sigma":sigma,"M":args.M,
+                                                   "steps":args.steps,"start_t":args.start_t})
+            elif args.scales==[1]:
                 out=sample(args.n_per_prompt,X_w,log_prior_w,w=w,sigma=sigma,M=args.M,
                            steps=args.steps,start_t=args.start_t,generator=generator)
             else:
@@ -120,6 +139,9 @@ def main(args):
                 "nn_dist":float(nearest.mean()),
                 "seconds_per_sample":elapsed/args.n_per_prompt
             }
+            if nodes is not None:
+                metrics["node_size"]=float(np.mean([node_size(tree,m) for m in nodes]))
+                metrics["distinct_nodes"]=len(set(nodes))
             print(metrics)
             results.append(metrics)
             row=concat_images_horizontally([retrieved]+images)
