@@ -62,6 +62,19 @@ sbatch runpygpu_chip.sh tree.py --bank banks/celeb.pt --save_path banks/celeb_tr
 sbatch runpygpu_chip.sh sample.py --bank banks/celeb.pt --method tree --tree banks/celeb_tree.pt --node_sampler lowrank --prompt_file prompts/celeb.txt --w 0 1 4
 ```
 
+## Mechanistic pilot: do closed-form machines predict a trained network?
+
+Following Kamb & Ganguli (*An analytic theory of creativity in convolutional diffusion models*), with text conditioning added:
+
+1. `caption.py`: captions each bank image with BLIP and stores `captions` and their CLIP text embeddings `C` in the bank.
+2. `train.py`: trains a flow-matching UNet (`textunet.py`) on exactly the bank's latents, with the same z_t = t·x + (1−t)·ε convention. It's conv-only by default, with the caption embedding added to the time embedding; `--attention` switches to self- and cross-attention over CLIP token states. Captions are dropped 10% of the time for CFG, and EMA weights are saved.
+3. `els.py`: the closed-form denoisers. `ideal` is the whole-image posterior mean. `ls` uses a local P×P patch at the same position for every pixel. `els` is equivariant: P×P patches from any position. Each takes a text prior over training images (`--prior caption` for similarity to their captions, or `image` for similarity to their CLIP image embeddings).
+4. `compare.py`: runs the network, feeds each z_t on its trajectory to every machine and patch size, and records r² against the network's x̂₀. It picks the best P per step on the even seeds and reports r² on the odd seeds, then compares final samples from the same noise. Outputs are `rows.csv`, `summary.json`, `r2_vs_t.png` and `finals.png`.
+
+`python scripts/gen_mech.py caption|train|compare` prints the cluster commands for each stage.
+
+ELS cost grows with P² × `--els_images` × H × W, so it gets its own, smaller `--els_patch_sizes`.
+
 ## Caveats
 
 - Samples are still combinations of training points, now chosen by the text. Prompts that nothing in the dataset matches can't be produced.

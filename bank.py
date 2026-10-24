@@ -37,6 +37,16 @@ def encode_texts_clip(model:CLIPModel,processor,texts:list,device)->torch.Tensor
     return F.normalize(feats.float(),dim=-1)
 
 
+@torch.no_grad()
+def encode_texts_clip_tokens(model:CLIPModel,processor,texts:list,device):
+    '''
+    per-token CLIP text states for cross-attention: (B,77,hidden) and the (B,77) attention mask
+    '''
+    inputs=processor(text=texts,return_tensors="pt",padding="max_length",truncation=True,max_length=77).to(device)
+    states=model.text_model(input_ids=inputs["input_ids"],attention_mask=inputs["attention_mask"]).last_hidden_state
+    return states.float(),inputs["attention_mask"]
+
+
 def load_vae(vae_name:str,device,torch_dtype=torch.float32)->AutoencoderKL:
     return AutoencoderKL.from_pretrained(vae_name,torch_dtype=torch_dtype).to(device).eval()
 
