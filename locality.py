@@ -216,3 +216,101 @@ def locality_sample_shrunk(groups:list,lam:torch.Tensor,Q:torch.Tensor,shrinkage
                 x0=masked_denoise(z,Xn,t,mask,log_prior,w,chunk)
             zs[j]=z+(t_next-t)*(x0-z)/(1-t)
     return zs
+
+
+@torch.no_grad()
+def low_rank_cov(X:torch.Tensor,k:int,device,oversample:int=16,iters:int=2,chunk:int=2048,generator:torch.Generator=None):
+    '''
+    top-k principal components of the rows of X (N,d) by randomized SVD with power iterations, streaming row
+    chunks to device, so X can be a large float16 tensor in CPU memory (e.g. a 256px pixel bank or one node of it)
+    returns mean (d,), evals (k',) covariance eigenvalues, V (d,k') orthonormal, resid: the average variance in
+    the directions left out, (trace(S) - sum(evals)) / (d - k'), so mean diag and trace of the covariance are kept
+    '''
+    N,d=X.shape
+    def rows(i):
+        return X[i:i+chunk].to(device).float()
+    mean=torch.zeros(d,device=device)
+    for i in range(0,N,chunk):
+        mean+=rows(i).sum(0)
+    mean/=N
+    total=0.0
+    for i in range(0,N,chunk):
+        total+=(rows(i)-mean).pow(2).sum().item()
+    trace=total/max(N-1,1)
+    l=min(k+oversample,N,d)
+    def times(M):
+        # Xc @ M for M (d,l)
+        return torch.cat([(rows(i)-mean)@M for i in range(0,N,chunk)])
+    def times_t(Y):
+        # Xc^T @ Y for Y (N,l)
+        out=torch.zeros(d,Y.shape[1],device=device)
+        for i in range(0,N,chunk):
+            out+=(rows(i)-mean).T@Y[i:i+chunk]
+        return out
+    omega=torch.randn(d,l,device=device,generator=generator)
+    Y=torch.linalg.qr(times(omega)).Q
+    for _ in range(iters):
+        Y=torch.linalg.qr(times(torch.linalg.qr(times_t(Y)).Q)).Q
+    B=times_t(Y).T                                   # (l,d) = Y^T Xc
+    _,s,Vh=torch.linalg.svd(B,full_matrices=False)
+    k=min(k,l)
+    evals=s[:k].pow(2)/max(N-1,1)
+    keep=evals>evals.max().clamp_min(1e-30)*1e-10
+    evals,V=evals[keep],Vh[:k][keep].T
+    resid=max(trace-evals.sum().item(),0.0)/max(d-V.shape[1],1)
+    return mean,evals,V,resid
+
+
+class LowRankWiener:
+    '''
+    Wiener filter for a covariance S = c0 I + U diag(c) U^T (U is d x m, any columns), without d x d matrices:
+    with M = S + sigma2 I = alpha I + U diag(c) U^T, alpha = c0 + sigma2, Woodbury gives
+        M^-1 r = (r - U (alpha diag(1/c) + U^T U)^-1 U^T r) / alpha,   W r = r - sigma2 M^-1 r
+    built from low_rank_cov factors of the node (and optionally the global bank), mirroring node_eig:
+        S = (1 - shrinkage) S_node + shrinkage S_global + ridge * v I
+    where each low-rank factor keeps its left-out variance as an isotropic term, and v is the mean variance
+    of S_global when shrinking and of S_node otherwise
+    '''
+    def __init__(self,node:tuple,global_factors:tuple=None,shrinkage:float=0.0,ridge:float=0.0):
+        mean,evals_n,V_n,resid_n=node
+        self.mean=mean
+        Us=[V_n]
+        cs=[(1-shrinkage)*evals_n] if shrinkage<1 else [torch.zeros_like(evals_n)]
+        c0=(1-shrinkage)*resid_n
+        v=(evals_n.sum().item()+resid_n*(V_n.shape[0]-V_n.shape[1]))/V_n.shape[0]
+        if shrinkage>0:
+            assert global_factors is not None,"shrinkage needs the global low-rank factors"
+            _,evals_g,V_g,resid_g=global_factors
+            Us.append(V_g)
+            cs.append(shrinkage*evals_g)
+            c0+=shrinkage*resid_g
+            v=(evals_g.sum().item()+resid_g*(V_g.shape[0]-V_g.shape[1]))/V_g.shape[0]
+        U=torch.cat(Us,1)
+        c=torch.cat(cs)
+        keep=c>0
+        self.U,self.c=U[:,keep],c[keep]
+        self.c0=c0+ridge*v
+        self.UtU=(self.U.T@self.U).double()
+
+    def apply(self,r:torch.Tensor,sigma2:float)->torch.Tensor:
+        alpha=self.c0+sigma2
+        Ur=(r@self.U).double()                                          # (B,m)
+        K=alpha*torch.diag(1/self.c.double())+self.UtU
+        y=torch.linalg.solve(K,Ur.T).T.to(r.dtype)                     # (B,m)
+        Minv_r=(r-y@self.U.T)/alpha
+        return r-sigma2*Minv_r
+
+
+@torch.no_grad()
+def wiener_lowrank_sample(n:int,stats:LowRankWiener,steps:int=10,t_min:float=1e-3,generator:torch.Generator=None,
+                          z0:torch.Tensor=None)->torch.Tensor:
+    '''
+    the linear Wiener sampler (as locality_sample(kind="wiener")) with LowRankWiener statistics
+    '''
+    d=stats.mean.shape[0]
+    z=torch.randn((n,d),generator=generator,device=stats.mean.device) if z0 is None else z0
+    ts=torch.linspace(t_min,1.0,steps+1).tolist()
+    for t,t_next in zip(ts[:-1],ts[1:]):
+        x0=stats.mean+stats.apply(z/t-stats.mean,((1-t)/t)**2)
+        z=z+(t_next-t)*(x0-z)/(1-t)
+    return z

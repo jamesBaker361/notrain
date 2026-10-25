@@ -48,6 +48,7 @@ parser.add_argument("--ls_patch_fracs",type=float,nargs="+",default=None,help="l
 parser.add_argument("--tau",type=float,default=0.02,help="locality: Wiener-matrix binarization threshold, relative to each row's max")
 parser.add_argument("--wiener_shrinkage",type=float,default=0.0,help="locality/wiener: blend the node covariance toward the full-bank covariance (0 = node only, 1 = global)")
 parser.add_argument("--wiener_ridge",type=float,default=0.01,help="locality/wiener: add this fraction of the mean pixel variance to the covariance diagonal so small (rank-deficient) nodes still get local masks at low noise")
+parser.add_argument("--wiener_rank",type=int,default=0,help="wiener: if > 0, use rank-k node (and global) covariances with the left-out variance kept as an isotropic term; no d x d matrices, so it runs at any d (e.g. 256px pixels)")
 parser.add_argument("--wiener_exact_eig",action="store_true",help="with --wiener_shrinkage, eigendecompose each node's blended covariance instead of the (equivalent, faster) Woodbury update of the global one")
 parser.add_argument("--node_text_prior",action="store_true",help="locality: also weight node images by w * log p(i|c) inside the softmax")
 parser.add_argument("--fid_samples",type=int,default=0,help="if > 0, generate this many extra samples per w (split across prompts) for FID/KID")
@@ -107,7 +108,14 @@ def main(args):
         eig_cache={}
         S_global=None
         spectrum=None
-        if args.node_sampler in ["locality","wiener"] and args.wiener_shrinkage>0:
+        global_lowrank=None
+        lowrank_wiener=args.node_sampler=="wiener" and args.wiener_rank>0
+        if lowrank_wiener and args.wiener_shrinkage>0:
+            from locality import low_rank_cov
+            # top components of the whole bank, streamed from wherever the bank lives
+            global_lowrank=low_rank_cov(X,args.wiener_rank,device)
+            print(f"global low-rank covariance: {global_lowrank[2].shape[1]} components, residual variance {global_lowrank[3]:.4g}")
+        if args.node_sampler in ["locality","wiener"] and args.wiener_shrinkage>0 and not lowrank_wiener:
             # global covariance without materializing a centered copy of the bank
             assert X.shape[1]<=20000,f"locality/wiener need d x d matrices; d={X.shape[1]} is too large (use pixel <=64px or the vq latents)"
             Xf=X.to(device).float()
@@ -158,6 +166,7 @@ def main(args):
                                   locality_kwargs={"tau":args.tau,"steps":args.steps,"shrinkage":args.wiener_shrinkage,"ridge":args.wiener_ridge,
                                                    "S_global":S_global,"spectrum":spectrum,"cache":eig_cache,
                                                    "shape":bank["shape"],"ls_patch_fracs":args.ls_patch_fracs,
+                                                   "wiener_rank":args.wiener_rank,"global_lowrank":global_lowrank,
                                                    "log_prior":log_priors[p] if args.node_text_prior else None,"w":w},
                                   device=device)
             return out,nodes,None

@@ -38,6 +38,7 @@ parser.add_argument("--steps",type=int,default=10)
 parser.add_argument("--sigma",type=float,default=0.25,help="cfdm smoothing, as a fraction of the median pairwise distance")
 parser.add_argument("--M",type=int,default=4)
 parser.add_argument("--tau",type=float,default=0.02)
+parser.add_argument("--wiener_rank",type=int,default=0,help="wiener: if > 0, rank-k global covariance (plus isotropic remainder), so it runs at any d")
 parser.add_argument("--ls_patch_fracs",type=float,nargs="+",default=None)
 parser.add_argument("--ls_chunk",type=int,default=1024,help="training images per chunk in the ls machine (memory)")
 parser.add_argument("--bank_device",type=str,default="auto",choices=["auto","cpu","cuda"],help="auto keeps banks over 4GB in CPU memory (ideal and ls stream it)")
@@ -76,7 +77,7 @@ def main(args):
     for m in args.methods:
         if m=="cfdm" and X.device!=torch.device(device):
             print("skipping cfdm: it needs the bank on the GPU")
-        elif m in ["wiener","locality"] and X.shape[1]>20000:
+        elif (m=="locality" or (m=="wiener" and args.wiener_rank==0)) and X.shape[1]>20000:
             print(f"skipping {m}: d={X.shape[1]} is too large for d x d matrices")
         else:
             methods.append(m)
@@ -84,7 +85,13 @@ def main(args):
     generator=torch.Generator(device=device).manual_seed(args.seed)
     sigma=args.sigma*median_patch_distance(X,shape,1,generator=torch.Generator(device=X.device).manual_seed(args.seed))
     spectrum=None
-    if "wiener" in methods or "locality" in methods:
+    lowrank=None
+    if "wiener" in methods and args.wiener_rank>0:
+        from locality import low_rank_cov,LowRankWiener
+        factors=low_rank_cov(X,args.wiener_rank,device)
+        # depth 0: the node is the whole bank, so the node and global covariances coincide
+        lowrank=LowRankWiener(factors,factors,1.0,0.0)
+    if "locality" in methods or ("wiener" in methods and lowrank is None):
         Xf=X.to(device).float()
         mu=Xf.mean(0)
         spectrum=global_spectrum((Xf.T@Xf-Xf.shape[0]*torch.outer(mu,mu))/(Xf.shape[0]-1))
@@ -99,6 +106,9 @@ def main(args):
             return machine_sample("ideal",z0,Xr,None,args.steps,t_min=t_min)
         if method=="ls":
             return machine_sample("ls",z0,Xr,ls_schedule,args.steps,t_min=t_min,chunk=args.ls_chunk)
+        if method=="wiener" and lowrank is not None:
+            from locality import wiener_lowrank_sample
+            return wiener_lowrank_sample(B,lowrank,args.steps,t_min,z0=z0.flatten(1)).reshape(z0.shape)
         if method=="cfdm":
             return sample(B,X,None,w=0,sigma=sigma,M=args.M,steps=args.steps,start_t=t_min,generator=generator,z0=z0.flatten(1)).reshape(z0.shape)
         # wiener / locality with the global covariance: shrinkage 1 leaves only the global part

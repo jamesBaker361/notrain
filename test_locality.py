@@ -180,3 +180,50 @@ def test_woodbury_lockstep_no_nodes(shrink_data):
     # every sample landed on a leaf: nothing to run
     Xall,S_global,(lam,Q),g=shrink_data
     assert locality_sample_shrunk([],lam,Q,0.5,0.0,"locality")==[]
+
+
+from locality import low_rank_cov,LowRankWiener,wiener_lowrank_sample
+
+
+def test_low_rank_cov_exact_when_rank_fits(shrink_data):
+    Xall,S_global,(lam,Q),g=shrink_data
+    Xn=Xall[:6]
+    mean,evals,V,resid=low_rank_cov(Xn,k=10,device="cpu",chunk=4,generator=torch.Generator().manual_seed(0))
+    S=torch.cov(Xn.T)
+    assert torch.allclose(mean,Xn.mean(0).to(mean.dtype),atol=1e-5)
+    assert torch.allclose((V*evals)@V.T,S.float(),atol=1e-4)
+    assert resid==pytest.approx(0,abs=1e-5)
+
+
+def test_low_rank_cov_truncation_keeps_trace_and_top_eigs():
+    g=torch.Generator().manual_seed(1)
+    d=40
+    X=torch.randn(500,d,generator=g)*torch.linspace(3,0.1,d)
+    mean,evals,V,resid=low_rank_cov(X.half(),k=8,device="cpu",chunk=128,generator=torch.Generator().manual_seed(0))
+    S=torch.cov(X.half().float().T)
+    true=torch.linalg.eigvalsh(S).flip(0)
+    assert torch.allclose(evals,true[:8],rtol=1e-2)
+    assert evals.sum().item()+resid*(d-V.shape[1])==pytest.approx(S.trace().item(),rel=1e-4)
+
+
+@pytest.mark.parametrize("shrinkage,ridge",[(0.0,0.0),(0.0,0.05),(0.5,0.0),(0.7,0.05),(1.0,0.0)])
+def test_low_rank_wiener_matches_dense(shrink_data,shrinkage,ridge):
+    # with enough components (no truncation) the low-rank filter is the dense one from node_eig
+    Xall,S_global,(lam,Q),g=shrink_data
+    Xn=Xall[:6].float()
+    gen=torch.Generator().manual_seed(0)
+    node=low_rank_cov(Xn,k=10,device="cpu",generator=gen)
+    glob=low_rank_cov(Xall.float(),k=10,device="cpu",generator=gen)
+    stats=LowRankWiener(node,glob,shrinkage,ridge)
+    exact=node_eig(Xn.double(),torch.cov(Xall.T),shrinkage,ridge,lowrank=False)
+    r=torch.randn(3,10,generator=g)
+    for s2 in [1e-2,1.0,50.0]:
+        W=wiener_matrix(exact[1],exact[2],s2,exact[3]).float()
+        assert torch.allclose(stats.apply(r,s2),r@W.T,atol=2e-3,rtol=1e-3)
+
+
+def test_wiener_lowrank_sampler(shrink_data):
+    Xall,S_global,(lam,Q),g=shrink_data
+    stats=LowRankWiener(low_rank_cov(Xall[:20].float(),4,"cpu"),low_rank_cov(Xall.float(),4,"cpu"),0.5,0.01)
+    out=wiener_lowrank_sample(5,stats,steps=10,generator=g)
+    assert out.shape==(5,10) and torch.isfinite(out).all()

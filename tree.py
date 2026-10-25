@@ -180,6 +180,16 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
     '''
     device=device or X.device
     members=node_members(tree,node)
+    if node_sampler=="wiener" and (locality_kwargs or {}).get("wiener_rank",0)>0 and len(members)>1:
+        # low-rank Wiener: statistics streamed from the bank (no d x d matrices, the node never has to fit on the GPU)
+        from locality import low_rank_cov,LowRankWiener,wiener_lowrank_sample
+        kwargs=locality_kwargs
+        cache=kwargs.get("cache",{})
+        key=("lowrank",node,kwargs.get("shrinkage",0.0),kwargs.get("ridge",0.0),kwargs["wiener_rank"])
+        if key not in cache:
+            cache[key]=LowRankWiener(low_rank_cov(X[members.to(X.device)],kwargs["wiener_rank"],device),
+                                     kwargs.get("global_lowrank"),kwargs.get("shrinkage",0.0),kwargs.get("ridge",0.0))
+        return wiener_lowrank_sample(n,cache[key],kwargs.get("steps",10),generator=generator)
     Xn=X[members.to(X.device)].to(device).float()
     members=members.to(device)
     def randn(*shape):
@@ -209,7 +219,7 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         shrinkage=kwargs.pop("shrinkage",0.0)
         ridge=kwargs.pop("ridge",0.0)
         S_global=kwargs.pop("S_global",None)
-        for k in ["spectrum","shape","ls_patch_fracs"]:
+        for k in ["spectrum","shape","ls_patch_fracs","wiener_rank","global_lowrank"]:
             kwargs.pop(k,None)
         log_prior=kwargs.pop("log_prior",None)
         if log_prior is not None:
@@ -248,7 +258,7 @@ def tree_sample(tree:dict,X:torch.Tensor,text_embed:torch.Tensor,n:int,w:float,l
     out=torch.empty(n,X.shape[1],device=device)
     groups={node:[i for i,m in enumerate(nodes) if m==node] for node in set(nodes)}
     kwargs=locality_kwargs or {}
-    if node_sampler in ["locality","wiener"] and kwargs.get("spectrum") is not None and kwargs.get("shrinkage",0)>0:
+    if node_sampler in ["locality","wiener"] and kwargs.get("spectrum") is not None and kwargs.get("shrinkage",0)>0 and not kwargs.get("wiener_rank"):
         # Woodbury path: all non-leaf nodes step together and share the global part of the Wiener matrix
         from locality import locality_sample_shrunk
         lam,Q=kwargs["spectrum"]

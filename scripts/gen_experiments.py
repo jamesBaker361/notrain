@@ -28,9 +28,10 @@ SETTINGS={
         "base":"google/ddpm-celebahq-256",
         "prompts":"prompts/celeb.txt",
         "train":"--batch_size 8 --gradient_checkpointing --max_steps 50000",
-        # locality/wiener need d x d matrices (d = 196608), and depth 0 would need the whole bank on the GPU
-        "methods":["cfdm","ls"],
+        # locality needs d x d matrices (d = 196608), so wiener runs low-rank; depth 0 would need the whole bank on the GPU
+        "methods":["cfdm","wiener","ls"],
         "depths":[2,4,8,99],
+        "extra":{"wiener":"--wiener_rank 512"},
     },
     "celebahq_ldm":{
         "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space vq --vae CompVis/ldm-celebahq-256 --resolution 256",
@@ -87,7 +88,8 @@ for name in settings:
                     # every sampler returns the leaf's image, so one retrieval run is enough
                     continue
                 run=f"{name}_{method}_L{depth}" if depth!=99 else f"{name}_retrieval"
-                print(sbatch(f"{method}_L{depth}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} --output_dir outputs/{run}"))
+                extra=cfg.get("extra",{}).get(method,"")
+                print(sbatch(f"{method}_L{depth}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} --output_dir outputs/{run}"))
         for kind,spec in nets.items():
             # the as-is checkpoint is unconditional, so only w=0 means anything; the cross-attention nets use w as the CFG scale
             ws="0" if kind=="pretrained" else "0 1 4"
@@ -95,6 +97,6 @@ for name in settings:
             print(sbatch(f"net_{kind}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method net --model {spec} --steps 50 --w {ws} {metrics} --output_dir outputs/{run}"))
     if stage in ["agreement","all"]:
         # target: the net trained from scratch on exactly our bank; the checkpoint and its fine-tune as "another DDPM"
-        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {nets['pretrained']} {nets['ft']} --methods {' '.join(['ideal']+cfg['methods'])} --n 64 --output_dir outputs/agreement_{name}"))
+        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {nets['pretrained']} {nets['ft']} --methods {' '.join(['ideal']+cfg['methods'])} {cfg.get('extra',{}).get('wiener','')} --n 64 --output_dir outputs/agreement_{name}"))
     if stage in ["summarize","all"]:
         print(f"python summarize.py --runs 'outputs/{name}_*' --output_dir outputs/summary_{name}")
