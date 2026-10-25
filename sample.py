@@ -18,6 +18,7 @@ from experiment_helpers.image_helpers import concat_images_horizontally,concat_i
 from cfdm import text_log_prior,top_k_subset,sample,sample_multiscale,median_patch_distance
 from bank import load_clip,encode_texts_clip,encode_images_clip,load_vae,bank_to_pixels,to_pil
 from tree import tree_sample,node_size
+from locality import global_spectrum
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--bank",type=str,default="banks/celeb_vae_256.pt")
@@ -39,7 +40,12 @@ parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","tree"],h
 parser.add_argument("--tree",type=str,default="",help="tree built by tree.py for this bank")
 parser.add_argument("--tree_depth",type=int,default=5,help="stop the descent at this depth (L)")
 parser.add_argument("--c_search",type=int,default=20,help="stop the descent at the first node with this many images or fewer")
-parser.add_argument("--node_sampler",type=str,default="lowrank",choices=["diagonal","lowrank","cfdm"],help="how to sample from the stopping node; cfdm uses --sigma, --M, --steps, --start_t")
+parser.add_argument("--node_sampler",type=str,default="lowrank",choices=["diagonal","lowrank","cfdm","locality","wiener"],help="how to sample from the stopping node; cfdm uses --sigma, --M, --steps, --start_t; locality/wiener (Lukoianov et al.) use --steps, --tau, --wiener_shrinkage, --wiener_ridge")
+parser.add_argument("--tau",type=float,default=0.02,help="locality: Wiener-matrix binarization threshold, relative to each row's max")
+parser.add_argument("--wiener_shrinkage",type=float,default=0.0,help="locality/wiener: blend the node covariance toward the full-bank covariance (0 = node only, 1 = global)")
+parser.add_argument("--wiener_ridge",type=float,default=0.01,help="locality/wiener: add this fraction of the mean pixel variance to the covariance diagonal so small (rank-deficient) nodes still get local masks at low noise")
+parser.add_argument("--wiener_exact_eig",action="store_true",help="with --wiener_shrinkage, eigendecompose each node's blended covariance instead of the (equivalent, faster) Woodbury update of the global one")
+parser.add_argument("--node_text_prior",action="store_true",help="locality: also weight node images by w * log p(i|c) inside the softmax")
 parser.add_argument("--copy_threshold",type=float,default=1e-2,help="relative distance below which a sample counts as a training copy")
 parser.add_argument("--eval_clip_model",type=str,default="",help="CLIP used for the clip_score metric; defaults to the conditioning CLIP (biased)")
 parser.add_argument("--seed",type=int,default=123)
@@ -79,6 +85,17 @@ def main(args):
         assert args.tree,"--method tree needs --tree"
         tree=torch.load(args.tree,weights_only=False)
         assert tree["n"]==X.shape[0],f"tree was built for {tree['n']} images but the bank has {X.shape[0]}"
+        eig_cache={}
+        S_global=None
+        spectrum=None
+        if args.node_sampler in ["locality","wiener"] and args.wiener_shrinkage>0:
+            # global covariance without materializing a centered copy of the bank
+            mu=X.mean(0)
+            S_global=(X.T@X-X.shape[0]*torch.outer(mu,mu))/(X.shape[0]-1)
+            if not args.wiener_exact_eig:
+                # Woodbury path: one eigendecomposition for the run instead of one per node
+                spectrum=global_spectrum(S_global)
+                S_global=None
 
     if args.schedule=="constant":
         assert args.scale_weights is not None and len(args.scale_weights)==len(args.scales),"--schedule constant needs one --scale_weights per scale"
@@ -116,7 +133,10 @@ def main(args):
                 out,nodes=tree_sample(tree,X,text_embeds[p],args.n_per_prompt,w,bank["logit_scale"],args.tree_depth,
                                       args.c_search,args.node_sampler,generator,
                                       cfdm_kwargs={"log_prior":log_priors[p],"w":w,"sigma":sigma,"M":args.M,
-                                                   "steps":args.steps,"start_t":args.start_t})
+                                                   "steps":args.steps,"start_t":args.start_t},
+                                      locality_kwargs={"tau":args.tau,"steps":args.steps,"shrinkage":args.wiener_shrinkage,"ridge":args.wiener_ridge,
+                                                       "S_global":S_global,"spectrum":spectrum,"cache":eig_cache,
+                                                       "log_prior":log_priors[p] if args.node_text_prior else None,"w":w})
             elif args.scales==[1]:
                 out=sample(args.n_per_prompt,X_w,log_prior_w,w=w,sigma=sigma,M=args.M,
                            steps=args.steps,start_t=args.start_t,generator=generator)

@@ -55,6 +55,19 @@ python -m pytest test_cfdm.py
 - `lowrank` (default): mean + Σ_i a_i (x_i − mean)/√(n−1) with a ~ N(0, I). It has the same per-dimension variance as `diagonal`, but keeps the correlations between dimensions, which gives coherent new faces.
 - `cfdm`: smoothed CFDM over the node's members (uses `--sigma`, `--M`, `--steps`, `--start_t`).
 
+- `locality`: the Wiener-mask analytical model of Lukoianov et al. (*Locality in Image Diffusion Models Emerges from Data Statistics*, Algorithm 1), with the node's images as the dataset and the node's covariance as the statistics (`locality.py`). Each output pixel q is a softmax over the node's images, using a masked distance that only counts the pixels in row q of the binarized Wiener matrix W_t = U·diag(λ/(λ+σ_t²))·Uᵀ (threshold `--tau`, relative to each row's max). Sampling starts from pure noise, with `--steps` Euler steps (the paper uses 10).
+- `wiener`: their linear baseline, mean + W_t (z/t − mean), using the node's statistics.
+
+The masks only become local at low noise if the covariance is full rank. A node with n images has rank n−1 (in 4096 latent dimensions), so on its own the masks stay at 65–90% of the image and you get exact copies. `--wiener_shrinkage` blends the node covariance toward the full-bank one (full rank for the 28k CelebA bank, as in the paper), and `--wiener_ridge` (default 0.01) adds a fraction of the mean variance to the diagonal. On a 400-image test, ridge 0.01 gave near-copies with local edits, while 0.1 gave novel but patchy mosaics. Each node's eigendecomposition is computed once when first visited and then cached.
+
+**Pixel space.** Everything above (tree, all node samplers, `sample.py`) also works on a pixel bank: `embed.py --space pixel --resolution 64` stores flattened RGB in [-1, 1], with d = 3·64·64 = 12,288, and needs no VAE. Keep the resolution at 64 or below (the paper uses 64×64 CelebA-HQ): the locality sampler works with d×d matrices, which is 600MB at 64px and 155GB at 256px. When a node has fewer images than dimensions and there's no shrinkage, its statistics come from an SVD of the node's images rather than a d×d eigendecomposition. In a 32px test this ran in about 0.1–0.2 s per sample on CPU. With `--wiener_shrinkage`, the global covariance is eigendecomposed once per run. Each node is then a low-rank Woodbury update of it, and all nodes step together so they share the global part of W_t. This is exact (tested against the per-node eigendecomposition, which is still available as `--wiener_exact_eig`). On CPU with 6 nodes of 20–200 images and 10 steps, `locality` went from 16.8 s to 6.1 s at d=3072, and from 177 s to 35 s at d=6144, with the one-time global eigendecomposition included. Peak GPU memory at 64px is about 4GB.
+
+```bash
+sbatch runpygpu_chip.sh embed.py --dataset jlbaker361/celeb --space pixel --resolution 64 --save_path banks/celeb_pix64.pt
+sbatch runpygpu_chip.sh tree.py --bank banks/celeb_pix64.pt --save_path banks/celeb_pix64_tree.pt --branching silhouette
+sbatch runpygpu_chip.sh sample.py --bank banks/celeb_pix64.pt --method tree --tree banks/celeb_pix64_tree.pt --node_sampler locality --steps 10 --wiener_shrinkage 0.5 --wiener_ridge 0 --c_search 200 --prompt_file prompts/celeb.txt --w 0 1 4
+```
+
 A walk that ends on a single-image leaf just returns that image. On macOS, run `tree.py` with `OMP_NUM_THREADS=1`; otherwise sklearn and torch can load clashing OpenMP runtimes and segfault.
 
 ```bash

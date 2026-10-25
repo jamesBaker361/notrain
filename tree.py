@@ -12,7 +12,8 @@ sample: descend from the root, picking a child with probability softmax(w * logi
 score is the child's mean CLIP similarity to the prompt (computed in PCA space; the constant c.mu term
 cancels in the softmax). w=0 is a uniform random walk (unconditional), large w is greedy. Stop at depth
 --tree_depth or at the first node with <= --c_search images, then sample from that node with
---node_sampler: diagonal Gaussian, low-rank Gaussian of the members, or CFDM over the members.
+--node_sampler: diagonal Gaussian, low-rank Gaussian of the members, CFDM over the members, or the
+Wiener-mask analytical model of Lukoianov et al. (locality.py) using the node's own covariance.
 
 usage: sbatch runpygpu_chip.sh tree.py --bank banks/celeb.pt --save_path banks/celeb_tree.pt --branching silhouette
 '''
@@ -165,11 +166,14 @@ def descend(tree:dict,text_embed:torch.Tensor,w:float,logit_scale:float,max_dept
 
 
 def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowrank",generator:torch.Generator=None,
-                cfdm_kwargs:dict=None)->torch.Tensor:
+                cfdm_kwargs:dict=None,locality_kwargs:dict=None)->torch.Tensor:
     '''
     n samples from one node: diagonal Gaussian (stored mean/var), low-rank Gaussian with the members'
-    covariance (same per-dim variance as diagonal, but keeps correlations), or CFDM over the members
+    covariance (same per-dim variance as diagonal, but keeps correlations), CFDM over the members, or
+    locality.py's masked analytical model ("locality") / linear Wiener filter ("wiener") with node statistics
     cfdm_kwargs: passed to cfdm.sample, e.g. log_prior (over all bank rows), w, sigma, M, steps, start_t
+    locality_kwargs: tau, steps, shrinkage, S_global, ridge, log_prior (over all bank rows), w, and cache, a dict
+    reused across calls so each node's eigendecomposition is computed once
     '''
     members=node_members(tree,node).to(X.device)
     Xn=X[members]
@@ -193,12 +197,27 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         if log_prior is not None:
             log_prior=torch.log_softmax(log_prior[members],dim=-1)
         return sample(n,Xn,log_prior,generator=generator,**kwargs)
+    if node_sampler in ["locality","wiener"]:
+        from locality import node_eig,locality_sample
+        kwargs=dict(locality_kwargs or {})
+        cache=kwargs.pop("cache",{})
+        shrinkage=kwargs.pop("shrinkage",0.0)
+        ridge=kwargs.pop("ridge",0.0)
+        S_global=kwargs.pop("S_global",None)
+        kwargs.pop("spectrum",None)
+        log_prior=kwargs.pop("log_prior",None)
+        if log_prior is not None:
+            log_prior=torch.log_softmax(log_prior[members],dim=-1)
+        if (node,shrinkage,ridge) not in cache:
+            cache[(node,shrinkage,ridge)]=node_eig(Xn,S_global,shrinkage,ridge)
+        return locality_sample(n,Xn,cache[(node,shrinkage,ridge)],node_sampler,log_prior=log_prior,generator=generator,**kwargs)
     raise ValueError(f"unknown node_sampler {node_sampler}")
 
 
 @torch.no_grad()
 def tree_sample(tree:dict,X:torch.Tensor,text_embed:torch.Tensor,n:int,w:float,logit_scale:float,max_depth:int=5,
-                c_search:int=20,node_sampler:str="lowrank",generator:torch.Generator=None,cfdm_kwargs:dict=None):
+                c_search:int=20,node_sampler:str="lowrank",generator:torch.Generator=None,cfdm_kwargs:dict=None,
+                locality_kwargs:dict=None):
     '''
     each of the n samples descends independently; samples landing in the same node are drawn together
     returns (n,D) samples and the node id of each
@@ -208,9 +227,29 @@ def tree_sample(tree:dict,X:torch.Tensor,text_embed:torch.Tensor,n:int,w:float,l
         cpu_generator=torch.Generator().manual_seed(int(torch.randint(0,2**31,(1,),generator=generator,device=generator.device)))
     nodes=[descend(tree,text_embed,w,logit_scale,max_depth,c_search,cpu_generator) for _ in range(n)]
     out=torch.empty(n,X.shape[1],device=X.device,dtype=X.dtype)
-    for node in set(nodes):
-        rows=[i for i,m in enumerate(nodes) if m==node]
-        out[rows]=sample_node(tree,X,node,len(rows),node_sampler,generator,cfdm_kwargs)
+    groups={node:[i for i,m in enumerate(nodes) if m==node] for node in set(nodes)}
+    kwargs=locality_kwargs or {}
+    if node_sampler in ["locality","wiener"] and kwargs.get("spectrum") is not None and kwargs.get("shrinkage",0)>0:
+        # Woodbury path: all non-leaf nodes step together and share the global part of the Wiener matrix
+        from locality import locality_sample_shrunk
+        lam,Q=kwargs["spectrum"]
+        log_prior=kwargs.get("log_prior")
+        inner=[node for node in groups if node_size(tree,node)>1]
+        batch=[]
+        for node in inner:
+            members=node_members(tree,node).to(X.device)
+            lp=None if log_prior is None else torch.log_softmax(log_prior[members],dim=-1)
+            batch.append((X[members],len(groups[node]),lp))
+        outs=locality_sample_shrunk(batch,lam,Q,kwargs["shrinkage"],kwargs.get("ridge",0.0),node_sampler,
+                                    kwargs.get("tau",0.02),kwargs.get("steps",10),w=kwargs.get("w",0.0),generator=generator)
+        for node,o in zip(inner,outs):
+            out[groups[node]]=o
+        for node in groups:
+            if node_size(tree,node)==1:
+                out[groups[node]]=X[node_members(tree,node).to(X.device)].expand(len(groups[node]),-1)
+        return out,nodes
+    for node,rows in groups.items():
+        out[rows]=sample_node(tree,X,node,len(rows),node_sampler,generator,cfdm_kwargs,locality_kwargs)
     return out,nodes
 
 
