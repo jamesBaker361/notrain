@@ -19,7 +19,7 @@ import numpy as np
 import torch
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
-from bank import load_clip,encode_texts_clip,encode_texts_clip_tokens,load_vae,bank_to_pixels,to_pil
+from bank import load_clip,encode_texts_clip,encode_texts_clip_tokens,load_bank_vae,bank_to_pixels,to_pil
 from textunet import TextUNet
 from els import denoise,r2,machine_sample,text_log_prior_from
 
@@ -86,7 +86,7 @@ def main(args):
     print("prompts",prompts)
 
     clip_model,clip_processor=load_clip(bank["clip_model"],device)
-    vae=load_vae(bank["vae"],device) if bank["space"]=="vae" else None
+    vae=load_bank_vae(bank,device)
     texts=[p for p,_ in prompts]
     pooled=encode_texts_clip(clip_model,clip_processor,texts,device)
     beta=bank["logit_scale"] if args.beta<0 else args.beta

@@ -17,12 +17,23 @@ parser.add_argument("--runs",type=str,nargs="+",required=True,help="run director
 parser.add_argument("--output_dir",type=str,default="outputs/summary")
 parser.add_argument("--label_width",type=int,default=150)
 
-METRICS=["clip_score","copy_rate","nn_dist","node_size","distinct_nodes","seconds_per_sample"]
+# per-prompt metrics are averaged over prompts; fid_*/kid_* come from sample.py's --fid_samples pass ("__all__" rows)
+METRICS=["clip_score","prompt_accuracy","copy_rate","nn_dist","diversity","lpips_diversity","node_size","distinct_nodes","seconds_per_sample",
+         "fid_test","kid_test","precision_test","recall_test","fid_train","kid_train","precision_train","recall_train",
+         "fid_copy_rate","fid_nn_dist","dino_nn_sim","dino_copy_rate","fid_prompt_accuracy","fid_lpips_diversity","fid_seconds_per_sample"]
 
 
 def run_label(args:dict)->str:
+    if args.get("method")=="net":
+        model=args.get("model","")
+        if model.startswith("pretrained:"):
+            return f"net {model.split(':',1)[1].split('/')[-1]} (as-is)"
+        # finetune.py runs live in weights/<name>/ema
+        return f"net {os.path.basename(os.path.dirname(model)) or model}"
     if args.get("method")=="tree":
-        return f"{args['node_sampler']} L{args['tree_depth']}"
+        if args["tree_depth"]>=99:
+            return "retrieval (leaf)"
+        return f"{args['node_sampler']} L{args['tree_depth']}"+(" (no tree)" if args["tree_depth"]==0 else "")
     return f"{args.get('method','cfdm')} scales{args.get('scales')}"
 
 
@@ -47,14 +58,17 @@ def main(args):
                 vals=[x[k] for x in rows if x.get(k) is not None]
                 entry[k]=float(np.mean(vals)) if vals else None
             table.append(entry)
+    # drop columns no run has (e.g. FID when --fid_samples wasn't used)
+    columns=[k for k in METRICS if any(e[k] is not None for e in table)]
+    table=[{k:v for k,v in e.items() if k in ["run","dir","w"]+columns} for e in table]
     with open(os.path.join(args.output_dir,"summary.csv"),"w",newline="") as f:
         writer=csv.DictWriter(f,fieldnames=list(table[0].keys()))
         writer.writeheader()
         writer.writerows(table)
-    header="| run | w | "+" | ".join(METRICS)+" |"
-    lines=[header,"|"+"---|"*(len(METRICS)+2)]
+    header="| run | w | "+" | ".join(columns)+" |"
+    lines=[header,"|"+"---|"*(len(columns)+2)]
     for e in table:
-        lines.append(f"| {e['run']} | {e['w']} | "+" | ".join("-" if e[k] is None else f"{e[k]:.3f}" for k in METRICS)+" |")
+        lines.append(f"| {e['run']} | {e['w']} | "+" | ".join("-" if e[k] is None else f"{e[k]:.3f}" for k in columns)+" |")
     with open(os.path.join(args.output_dir,"summary.md"),"w") as f:
         f.write("\n".join(lines)+"\n")
     print("\n".join(lines))

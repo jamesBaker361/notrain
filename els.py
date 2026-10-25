@@ -34,11 +34,26 @@ def _prior_logits(log_prior,w,B,N,device):
     return w*lp
 
 
-def ideal_denoise(z:torch.Tensor,X:torch.Tensor,t:float,log_prior:torch.Tensor=None,w:float=1.0)->torch.Tensor:
+def ideal_denoise(z:torch.Tensor,X:torch.Tensor,t:float,log_prior:torch.Tensor=None,w:float=1.0,chunk:int=8192)->torch.Tensor:
+    '''
+    whole-image posterior mean; streams X in chunks (moved to z's device), so X can stay on the CPU
+    '''
     B,N=z.shape[0],X.shape[0]
-    zf,Xf=z.flatten(1),X.flatten(1)
-    logits=(2*t*zf@Xf.T-t*t*Xf.pow(2).sum(-1))/(2*(1-t)**2)+_prior_logits(log_prior,w,B,N,z.device)
-    return (torch.softmax(logits,dim=-1)@Xf).reshape(z.shape)
+    zf=z.flatten(1)
+    prior=_prior_logits(log_prior,w,B,N,z.device)
+    m=torch.full((B,),-math.inf,device=z.device,dtype=zf.dtype)
+    s=torch.zeros(B,device=z.device,dtype=zf.dtype)
+    acc=torch.zeros_like(zf)
+    for i in range(0,N,chunk):
+        Xc=X[i:i+chunk].flatten(1).to(z.device,zf.dtype)
+        logits=(2*t*zf@Xc.T-t*t*Xc.pow(2).sum(-1))/(2*(1-t)**2)+prior[:,i:i+chunk]
+        m_new=torch.maximum(m,logits.amax(1))
+        scale=torch.exp(m-m_new)
+        e=torch.exp(logits-m_new[:,None])
+        s=s*scale+e.sum(1)
+        acc=acc*scale[:,None]+e@Xc
+        m=m_new
+    return (acc/s[:,None]).reshape(z.shape)
 
 
 def _box_sum(x:torch.Tensor,P:int)->torch.Tensor:
@@ -59,17 +74,17 @@ def ls_denoise(z:torch.Tensor,X:torch.Tensor,t:float,P:int,log_prior:torch.Tenso
     assert P%2==1,"patch size must be odd"
     B,C,H,W=z.shape
     N=X.shape[0]
-    if x_sq is None:
-        x_sq=_box_sum(X.pow(2).sum(1),P)
     prior=_prior_logits(log_prior,w,B,N,z.device)
     # streaming softmax: running max m, normalizer s, and weighted sum acc per (b,h,w)
     m=torch.full((B,H,W),-math.inf,device=z.device,dtype=z.dtype)
     s=torch.zeros(B,H,W,device=z.device,dtype=z.dtype)
     acc=torch.zeros(B,C,H,W,device=z.device,dtype=z.dtype)
     for i in range(0,N,chunk):
-        Xc=X[i:i+chunk]
+        # chunks move to z's device, so X can stay on the CPU
+        Xc=X[i:i+chunk].to(z.device,z.dtype)
+        xc_sq=_box_sum(Xc.pow(2).sum(1),P) if x_sq is None else x_sq[i:i+chunk].to(z.device,z.dtype)
         cross=_box_sum(torch.einsum("bchw,nchw->bnhw",z,Xc),P)
-        logits=(2*t*cross-t*t*x_sq[i:i+chunk][None])/(2*(1-t)**2)+prior[:,i:i+chunk,None,None]
+        logits=(2*t*cross-t*t*xc_sq[None])/(2*(1-t)**2)+prior[:,i:i+chunk,None,None]
         m_new=torch.maximum(m,logits.amax(1))
         scale=torch.exp(m-m_new)
         e=torch.exp(logits-m_new[:,None])
@@ -153,3 +168,21 @@ def machine_sample(kind:str,z0:torch.Tensor,X:torch.Tensor,patch_schedule,steps:
         x0=denoise(kind,z,X,t,patch_schedule(t) if kind!="ideal" else None,log_prior,w,**kwargs)
         z=z+(t_next-t)*(x0-z)/(1-t)
     return z
+
+
+# Kamb & Ganguli patch sizes fitted to a CelebA-HQ 64x64 DDPM over 10 steps (Lukoianov et al. Appendix C.4), as fractions of the side
+CELEBA_PATCH_FRACS=[64/64,64/64,45/64,25/64,17/64,17/64,9/64,7/64,5/64,3/64]
+
+
+def patch_schedule_from_fracs(fracs:list,side:int,t_min:float=1e-3):
+    '''
+    t -> odd patch size: fracs (noise to data) are spread evenly over [t_min, 1) and scaled by the image side
+    '''
+    sizes=[]
+    for f in fracs:
+        P=max(1,int(round(f*side)))
+        sizes.append(P if P%2==1 else P+1)
+    def schedule(t:float)->int:
+        u=(t-t_min)/(1-t_min)
+        return sizes[min(int(u*len(sizes)),len(sizes)-1)]
+    return schedule

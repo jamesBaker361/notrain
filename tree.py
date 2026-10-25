@@ -166,25 +166,30 @@ def descend(tree:dict,text_embed:torch.Tensor,w:float,logit_scale:float,max_dept
 
 
 def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowrank",generator:torch.Generator=None,
-                cfdm_kwargs:dict=None,locality_kwargs:dict=None)->torch.Tensor:
+                cfdm_kwargs:dict=None,locality_kwargs:dict=None,device=None)->torch.Tensor:
     '''
     n samples from one node: diagonal Gaussian (stored mean/var), low-rank Gaussian with the members'
     covariance (same per-dim variance as diagonal, but keeps correlations), CFDM over the members, or
     locality.py's masked analytical model ("locality") / linear Wiener filter ("wiener") with node statistics
     cfdm_kwargs: passed to cfdm.sample, e.g. log_prior (over all bank rows), w, sigma, M, steps, start_t
+    ls: Kamb & Ganguli's local score machine (els.py) with a patch-size schedule (locality_kwargs shape, ls_patch_fracs)
     locality_kwargs: tau, steps, shrinkage, S_global, ridge, log_prior (over all bank rows), w, and cache, a dict
     reused across calls so each node's eigendecomposition is computed once
+    device: where to sample (default X's device); X may stay on the CPU (e.g. a float16 256px pixel bank),
+    only the node's images are moved
     '''
-    members=node_members(tree,node).to(X.device)
-    Xn=X[members]
+    device=device or X.device
+    members=node_members(tree,node)
+    Xn=X[members.to(X.device)].to(device).float()
+    members=members.to(device)
     def randn(*shape):
-        return torch.randn(shape,generator=generator,device=X.device,dtype=X.dtype)
+        return torch.randn(shape,generator=generator,device=device,dtype=Xn.dtype)
     if Xn.shape[0]==1:
         return Xn.expand(n,-1).clone()
     if node_sampler=="diagonal":
         k=int(tree["internal_index"][node])
-        mean=tree["vae_mean"][k].to(X.device)
-        std=tree["vae_var"][k].to(X.device).sqrt()
+        mean=tree["vae_mean"][k].to(device)
+        std=tree["vae_var"][k].to(device).sqrt()
         return mean+std*randn(n,X.shape[1])
     if node_sampler=="lowrank":
         mean=Xn.mean(0)
@@ -195,7 +200,7 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         kwargs=dict(cfdm_kwargs or {})
         log_prior=kwargs.pop("log_prior",None)
         if log_prior is not None:
-            log_prior=torch.log_softmax(log_prior[members],dim=-1)
+            log_prior=torch.log_softmax(log_prior[members.to(log_prior.device)].to(device),dim=-1)
         return sample(n,Xn,log_prior,generator=generator,**kwargs)
     if node_sampler in ["locality","wiener"]:
         from locality import node_eig,locality_sample
@@ -204,29 +209,43 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         shrinkage=kwargs.pop("shrinkage",0.0)
         ridge=kwargs.pop("ridge",0.0)
         S_global=kwargs.pop("S_global",None)
-        kwargs.pop("spectrum",None)
+        for k in ["spectrum","shape","ls_patch_fracs"]:
+            kwargs.pop(k,None)
         log_prior=kwargs.pop("log_prior",None)
         if log_prior is not None:
-            log_prior=torch.log_softmax(log_prior[members],dim=-1)
+            log_prior=torch.log_softmax(log_prior[members.to(log_prior.device)].to(device),dim=-1)
         if (node,shrinkage,ridge) not in cache:
             cache[(node,shrinkage,ridge)]=node_eig(Xn,S_global,shrinkage,ridge)
         return locality_sample(n,Xn,cache[(node,shrinkage,ridge)],node_sampler,log_prior=log_prior,generator=generator,**kwargs)
+    if node_sampler=="ls":
+        # Kamb & Ganguli local score machine over the node's images, with a patch-size schedule
+        from els import machine_sample,patch_schedule_from_fracs,CELEBA_PATCH_FRACS
+        kwargs=dict(locality_kwargs or {})
+        shape=kwargs["shape"]
+        schedule=patch_schedule_from_fracs(kwargs.get("ls_patch_fracs") or CELEBA_PATCH_FRACS,shape[-1])
+        log_prior=kwargs.get("log_prior")
+        if log_prior is not None:
+            log_prior=torch.log_softmax(log_prior[members.to(log_prior.device)].to(device),dim=-1)
+        z0=torch.randn((n,*shape),generator=generator,device=device,dtype=Xn.dtype)
+        out=machine_sample("ls",z0,Xn.reshape(-1,*shape),schedule,kwargs.get("steps",10),log_prior,kwargs.get("w",0.0))
+        return out.flatten(1)
     raise ValueError(f"unknown node_sampler {node_sampler}")
 
 
 @torch.no_grad()
 def tree_sample(tree:dict,X:torch.Tensor,text_embed:torch.Tensor,n:int,w:float,logit_scale:float,max_depth:int=5,
                 c_search:int=20,node_sampler:str="lowrank",generator:torch.Generator=None,cfdm_kwargs:dict=None,
-                locality_kwargs:dict=None):
+                locality_kwargs:dict=None,device=None):
     '''
     each of the n samples descends independently; samples landing in the same node are drawn together
-    returns (n,D) samples and the node id of each
+    returns (n,D) samples and the node id of each; device as in sample_node
     '''
+    device=device or X.device
     cpu_generator=None
     if generator is not None:
         cpu_generator=torch.Generator().manual_seed(int(torch.randint(0,2**31,(1,),generator=generator,device=generator.device)))
     nodes=[descend(tree,text_embed,w,logit_scale,max_depth,c_search,cpu_generator) for _ in range(n)]
-    out=torch.empty(n,X.shape[1],device=X.device,dtype=X.dtype)
+    out=torch.empty(n,X.shape[1],device=device)
     groups={node:[i for i,m in enumerate(nodes) if m==node] for node in set(nodes)}
     kwargs=locality_kwargs or {}
     if node_sampler in ["locality","wiener"] and kwargs.get("spectrum") is not None and kwargs.get("shrinkage",0)>0:
@@ -237,19 +256,19 @@ def tree_sample(tree:dict,X:torch.Tensor,text_embed:torch.Tensor,n:int,w:float,l
         inner=[node for node in groups if node_size(tree,node)>1]
         batch=[]
         for node in inner:
-            members=node_members(tree,node).to(X.device)
-            lp=None if log_prior is None else torch.log_softmax(log_prior[members],dim=-1)
-            batch.append((X[members],len(groups[node]),lp))
+            members=node_members(tree,node)
+            lp=None if log_prior is None else torch.log_softmax(log_prior[members.to(log_prior.device)].to(device),dim=-1)
+            batch.append((X[members.to(X.device)].to(device).float(),len(groups[node]),lp))
         outs=locality_sample_shrunk(batch,lam,Q,kwargs["shrinkage"],kwargs.get("ridge",0.0),node_sampler,
                                     kwargs.get("tau",0.02),kwargs.get("steps",10),w=kwargs.get("w",0.0),generator=generator)
         for node,o in zip(inner,outs):
             out[groups[node]]=o
         for node in groups:
             if node_size(tree,node)==1:
-                out[groups[node]]=X[node_members(tree,node).to(X.device)].expand(len(groups[node]),-1)
+                out[groups[node]]=X[node_members(tree,node).to(X.device)].to(device).float().expand(len(groups[node]),-1)
         return out,nodes
     for node,rows in groups.items():
-        out[rows]=sample_node(tree,X,node,len(rows),node_sampler,generator,cfdm_kwargs,locality_kwargs)
+        out[rows]=sample_node(tree,X,node,len(rows),node_sampler,generator,cfdm_kwargs,locality_kwargs,device)
     return out,nodes
 
 

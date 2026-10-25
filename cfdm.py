@@ -104,15 +104,16 @@ def initial_sample(n:int,X:torch.Tensor,start_t:float,log_prior:torch.Tensor=Non
 
 @torch.no_grad()
 def sample(n:int,X:torch.Tensor,log_prior:torch.Tensor=None,w:float=1.0,sigma:float=0.0,M:int=1,
-           steps:int=50,start_t:float=0.0,generator:torch.Generator=None,return_trajectory:bool=False):
+           steps:int=50,start_t:float=0.0,generator:torch.Generator=None,return_trajectory:bool=False,z0:torch.Tensor=None):
     '''
     forward Euler from start_t to t=1 (Algorithm 1). The last step from t to 1 lands exactly
     on smoothed_k_t(z)/t, so nothing blows up at t=1.
     X: (N,D) training points (flattened pixels or latents), log_prior: (N,) from text_log_prior
+    z0: optional (n,D) starting point at start_t instead of initial_sample (e.g. shared noise with start_t ~ 0)
     '''
     assert 0<=start_t<1,"start_t must be in [0,1)"
     x_sq=X.pow(2).sum(-1)
-    z=initial_sample(n,X,start_t,log_prior,w,generator)
+    z=initial_sample(n,X,start_t,log_prior,w,generator) if z0 is None else z0
     ts=torch.linspace(start_t,1.0,steps+1).tolist()
     if ts[0]==0:
         # v_0 is undefined (1/t); k_0 = 0 so the first Euler step only rescales noise
@@ -234,8 +235,10 @@ def median_patch_distance(X:torch.Tensor,shape:tuple,s:int,n_probe:int=512,gener
     '''
     median pairwise distance between random candidate patches at scale s; sets the per-scale smoothing
     '''
-    patches,_=patch_bank(X,shape,s)
-    probe=patches[torch.randperm(patches.shape[0],generator=generator,device=patches.device)[:n_probe]]
+    # probe a random subset of images first, so a large (possibly CPU, float16) bank is never patchified whole
+    idx=torch.randperm(X.shape[0],generator=generator,device=generator.device if generator is not None else "cpu")[:n_probe]
+    patches,_=patch_bank(X[idx.to(X.device)].float(),shape,s)
+    probe=patches[torch.randperm(patches.shape[0],generator=generator,device=generator.device if generator is not None else "cpu").to(patches.device)[:n_probe]]
     pair=torch.cdist(probe,probe)
     return pair[pair>0].median().item()
 

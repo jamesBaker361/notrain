@@ -30,7 +30,7 @@ Since $c$ is fixed for a whole trajectory, the text prior is computed once per p
 
 ```bash
 git submodule update --init
-sbatch runpygpu_chip.sh embed.py --dataset jlbaker361/celeb --space vae --resolution 256 --save_path banks/celeb_vae_256.pt
+sbatch runpygpu_chip.sh embed.py --dataset korexyz/celeba-hq-256x256 --test_split validation --space vae --resolution 256 --save_path banks/celeb_vae_256.pt
 sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompt_file prompts/faces.txt --w 0 1 4 --sigma 0.25
 python -m pytest test_cfdm.py
 ```
@@ -63,12 +63,48 @@ The masks only become local at low noise if the covariance is full rank. A node 
 **Pixel space.** Everything above (tree, all node samplers, `sample.py`) also works on a pixel bank: `embed.py --space pixel --resolution 64` stores flattened RGB in [-1, 1], with d = 3·64·64 = 12,288, and needs no VAE. Keep the resolution at 64 or below (the paper uses 64×64 CelebA-HQ): the locality sampler works with d×d matrices, which is 600MB at 64px and 155GB at 256px. When a node has fewer images than dimensions and there's no shrinkage, its statistics come from an SVD of the node's images rather than a d×d eigendecomposition. In a 32px test this ran in about 0.1–0.2 s per sample on CPU. With `--wiener_shrinkage`, the global covariance is eigendecomposed once per run. Each node is then a low-rank Woodbury update of it, and all nodes step together so they share the global part of W_t. This is exact (tested against the per-node eigendecomposition, which is still available as `--wiener_exact_eig`). On CPU with 6 nodes of 20–200 images and 10 steps, `locality` went from 16.8 s to 6.1 s at d=3072, and from 177 s to 35 s at d=6144, with the one-time global eigendecomposition included. Peak GPU memory at 64px is about 4GB.
 
 ```bash
-sbatch runpygpu_chip.sh embed.py --dataset jlbaker361/celeb --space pixel --resolution 64 --save_path banks/celeb_pix64.pt
+sbatch runpygpu_chip.sh embed.py --dataset korexyz/celeba-hq-256x256 --test_split validation --space pixel --resolution 64 --save_path banks/celeb_pix64.pt
 sbatch runpygpu_chip.sh tree.py --bank banks/celeb_pix64.pt --save_path banks/celeb_pix64_tree.pt --branching silhouette
 sbatch runpygpu_chip.sh sample.py --bank banks/celeb_pix64.pt --method tree --tree banks/celeb_pix64_tree.pt --node_sampler locality --steps 10 --wiener_shrinkage 0.5 --wiener_ridge 0 --c_search 200 --prompt_file prompts/celeb.txt --w 0 1 4
 ```
 
-A walk that ends on a single-image leaf just returns that image. On macOS, run `tree.py` with `OMP_NUM_THREADS=1`; otherwise sklearn and torch can load clashing OpenMP runtimes and segfault.
+A walk that ends on a single-image leaf just returns that image.
+
+## Evaluation
+
+`sample.py --fid_samples N` generates N extra samples per w, spread across the prompts, and reports:
+
+- `fid_test` / `kid_test`: FID and KID against held-out images (`embed.py --holdout K`), which are never in the tree or the samplers. KID is unbiased at a few hundred samples; FID is biased upward at small N, so only compare runs with the same N.
+- `fid_train` / `kid_train`: the same against training images. A sampler that copies training images scores very well here. Read it next to `fid_test` and `fid_copy_rate`: if it's much lower than `fid_test`, the sampler is memorizing.
+- `fid_copy_rate` / `fid_nn_dist`: the fraction of samples within `--copy_threshold` of a training image, and the mean distance to the nearest one, over all N samples.
+
+The same pass also reports:
+
+- `precision_*` / `recall_*`: k-NN precision (are samples realistic?) and recall (do they cover the data?) in the same Inception space as FID.
+- `dino_nn_sim` / `dino_copy_rate`: cosine similarity to the nearest training image in DINOv2 space, and the fraction above `--dino_copy_threshold`. This catches near-copies that the pixel metric misses. Training features are cached next to the bank.
+- `fid_prompt_accuracy`: the fraction of samples whose best-matching prompt, scored by the independent `--eval_clip_model`, is their own.
+- `fid_lpips_diversity`: mean pairwise LPIPS between samples of the same prompt.
+
+Per-prompt metrics also include `diversity` (pixel distance), `lpips_diversity` and `prompt_accuracy`. FID/KID need `pip install torch-fidelity`.
+
+**Baselines.**
+- `--node_sampler ls`: Kamb & Ganguli's local score machine, with the CelebA-64 patch schedule from Lukoianov et al.
+- Trained diffusion models (`pretrained.py`, `finetune.py`); see the next section.
+- `agreement.py`: the paper's Table 1. It runs `ideal`, `cfdm`, `wiener`, `locality` and `ls` over the whole training set from the same noise as the trained network, and reports r² and MSE against it. A second network trained with another seed (`--model2`) gives the ceiling.
+
+## Standard datasets and trained baselines
+
+The experiments use standard Hugging Face datasets with their official held-out splits: `uoft-cs/cifar10` (50k train / 10k test) and `korexyz/celeba-hq-256x256` (28k train / 2k validation). `embed.py --test_split` stores the held-out split as `X_test` (the FID reference). `--label_column label --caption_template "a photo of a {}"` makes captions from class names; CelebA-HQ gets BLIP captions from `caption.py`. `--space vq` encodes images with the VQ autoencoder of `CompVis/ldm-celebahq-256`, so the closed-form samplers work in the same 3×64×64 latent space as that LDM.
+
+`pretrained.py` wraps `google/ddpm-cifar10-32`, `google/ddpm-celebahq-256` and `CompVis/ldm-celebahq-256` (noise-predicting `UNet2DModel`s) in this repo's convention z = t·x + (1−t)·ε. The noisy state x_k = z/√(t²+(1−t)²) has √ᾱ = t/√(t²+(1−t)²), the timestep is interpolated from the checkpoint's schedule, and x̂₀ = (x_k − √(1−ᾱ)·ε̂)/√ᾱ. That way the networks and the closed-form samplers share the time grid and the starting noise. Sampling starts at the checkpoint's noisiest training point (`t_min`: 0.006 for the DDPMs, 0.068 for the LDM).
+
+`--cross_attention` attaches a cross-attention adapter (to CLIP text tokens) after every self-attention layer. Its output projection starts at zero, so the model initially matches the checkpoint. `finetune.py` trains with the checkpoint's own objective (noise prediction), dropping captions for classifier-free guidance:
+- `--init pretrained`: fine-tunes the checkpoint.
+- `--init scratch`: trains the same architecture from random weights on exactly our bank.
+
+`sample.py --method net --model ...` takes `pretrained:<repo>` (the checkpoint as-is, unconditional) or a `finetune.py` checkpoint, where w is the CFG scale. `agreement.py` compares every method against a target network from the same noise.
+
+`scripts/gen_experiments.py build|train|sample|agreement|summarize [setting]` runs three settings: `cifar10_pix32`, `celebahq_pix256` and `celebahq_ldm`. Each has `cfdm`/`locality`/`wiener`/`ls` at depths 0, 2, 4 and 8, a retrieval baseline (depth 99), and three trained nets (as-is, fine-tuned, scratch). `celebahq_pix256` keeps its 11GB float16 bank in CPU memory and skips `locality`/`wiener` (d×d matrices at d = 196,608) and depth 0. `summarize.py` collects the runs into `summary.md`/`summary.csv` and side-by-side images. On macOS, run `tree.py` with `OMP_NUM_THREADS=1`; otherwise sklearn and torch can load clashing OpenMP runtimes and segfault.
 
 ```bash
 sbatch runpygpu_chip.sh tree.py --bank banks/celeb.pt --save_path banks/celeb_tree.pt --branching silhouette

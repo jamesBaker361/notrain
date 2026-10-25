@@ -1,0 +1,9 @@
+banks/
+outputs/
+wandb/
+slurm_chip/
+jobs.txt
+__pycache__/
+.pytest_cache/
+weights/
+compare/

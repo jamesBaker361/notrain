@@ -1,13 +1,13 @@
 '''
-helpers for building and decoding the "bank": training points X (flattened pixels or VAE latents)
-and their CLIP image embeddings T
+helpers for building and decoding the "bank": training points X (flattened pixels, SD-VAE latents, or the
+VQ latents of CompVis/ldm-celebahq-256) and their CLIP image embeddings T
 '''
 import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from transformers import CLIPModel, AutoProcessor
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKL,VQModel
 
 
 def _features(out)->torch.Tensor:
@@ -47,19 +47,38 @@ def encode_texts_clip_tokens(model:CLIPModel,processor,texts:list,device):
     return states.float(),inputs["attention_mask"]
 
 
-def load_vae(vae_name:str,device,torch_dtype=torch.float32)->AutoencoderKL:
+def load_vae(vae_name:str,device,torch_dtype=torch.float32,space:str="vae"):
+    '''
+    space "vae": an AutoencoderKL repo (e.g. stabilityai/sd-vae-ft-mse); space "vq": the VQ autoencoder in the
+    vqvae subfolder of a latent-diffusion repo (e.g. CompVis/ldm-celebahq-256)
+    '''
+    if space=="vq":
+        return VQModel.from_pretrained(vae_name,subfolder="vqvae",torch_dtype=torch_dtype).to(device).eval()
     return AutoencoderKL.from_pretrained(vae_name,torch_dtype=torch_dtype).to(device).eval()
 
 
+def load_bank_vae(bank:dict,device,torch_dtype=torch.float32):
+    # the autoencoder a bank was built with, or None for a pixel bank
+    if bank["space"]=="pixel":
+        return None
+    return load_vae(bank["vae"],device,torch_dtype,bank["space"])
+
+
 @torch.no_grad()
-def encode_vae(vae:AutoencoderKL,pixels:torch.Tensor)->torch.Tensor:
-    # pixels in [-1,1]; use the posterior mean so the bank is deterministic
+def encode_vae(vae,pixels:torch.Tensor)->torch.Tensor:
+    # pixels in [-1,1]
+    if isinstance(vae,VQModel):
+        # pre-quantization latents, the space latent diffusion samples in (LDMPipeline decodes them unscaled)
+        return vae.encode(pixels.to(vae.dtype)).latents.float()
+    # posterior mean so the bank is deterministic
     latents=vae.encode(pixels.to(vae.dtype)).latent_dist.mean
     return latents.float()*vae.config.scaling_factor
 
 
 @torch.no_grad()
-def decode_vae(vae:AutoencoderKL,latents:torch.Tensor)->torch.Tensor:
+def decode_vae(vae,latents:torch.Tensor)->torch.Tensor:
+    if isinstance(vae,VQModel):
+        return vae.decode(latents.to(vae.dtype)).sample.float()
     return vae.decode((latents/vae.config.scaling_factor).to(vae.dtype)).sample.float()
 
 
@@ -75,5 +94,6 @@ def bank_to_pixels(bank:dict,flat:torch.Tensor,vae:AutoencoderKL=None,batch_size
     '''
     x=flat.reshape(-1,*bank["shape"])
     if bank["space"]=="pixel":
-        return x
+        # pixel banks may be stored in float16
+        return x.float()
     return torch.cat([decode_vae(vae,x[i:i+batch_size].to(vae.device)) for i in range(0,len(x),batch_size)]).cpu()

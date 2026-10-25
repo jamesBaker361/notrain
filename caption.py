@@ -40,7 +40,8 @@ def main(args):
     dataset=load_dataset(embed_args["dataset"],split=embed_args["split"])
     if embed_args["limit"]>0:
         dataset=dataset.select(range(min(embed_args["limit"],len(dataset))))
-    assert len(dataset)==bank["X"].shape[0],f"dataset has {len(dataset)} rows but the bank has {bank['X'].shape[0]}"
+    # held-out rows (embed.py --holdout) come last and aren't captioned
+    dataset=dataset.select(range(bank["X"].shape[0]))
 
     processor=BlipProcessor.from_pretrained(args.captioner)
     captioner=BlipForConditionalGeneration.from_pretrained(args.captioner,torch_dtype=torch_dtype).to(device).eval()

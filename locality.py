@@ -124,13 +124,15 @@ def binarize(W:torch.Tensor,tau:float)->torch.Tensor:
 
 
 def masked_denoise(z:torch.Tensor,Xn:torch.Tensor,t:float,mask:torch.Tensor,log_prior:torch.Tensor=None,w:float=0.0,
-                   chunk:int=256)->torch.Tensor:
+                   chunk:int=256,max_elems:float=1.5e8)->torch.Tensor:
     '''
     eq. 8 with a per-pixel binary mask, streaming the softmax over chunks of images
     z: (B,d), Xn: (n,d), mask: (d,d) with row q = pixels that output pixel q looks at, log_prior: (n,)
     '''
     a,b=t,1-t
     B,d=z.shape
+    # keep the (B, chunk, d) temporaries around max_elems entries so large batches fit in GPU memory
+    chunk=max(1,min(chunk,int(max_elems//(B*d))))
     m=torch.full((B,d),-math.inf,device=z.device,dtype=z.dtype)
     s=torch.zeros(B,d,device=z.device,dtype=z.dtype)
     acc=torch.zeros(B,d,device=z.device,dtype=z.dtype)
@@ -163,14 +165,15 @@ def wiener_denoise(z:torch.Tensor,t:float,mean:torch.Tensor,evals:torch.Tensor,e
 
 @torch.no_grad()
 def locality_sample(n:int,Xn:torch.Tensor,stats:tuple,kind:str="locality",tau:float=0.02,steps:int=10,t_min:float=1e-3,
-                    log_prior:torch.Tensor=None,w:float=0.0,generator:torch.Generator=None,chunk:int=256)->torch.Tensor:
+                    log_prior:torch.Tensor=None,w:float=0.0,generator:torch.Generator=None,chunk:int=256,
+                    z0:torch.Tensor=None)->torch.Tensor:
     '''
     Euler on v = (x0_hat - z)/(1 - t) from pure noise at t_min to t = 1 (the deterministic DDIM update for
     this interpolation); the last step lands on x0_hat
     stats: (mean, evals, evecs, floor) from node_eig; kind: "locality" (masked, eq. 8) or "wiener" (linear filter)
     '''
     mean,evals,evecs,floor=stats
-    z=torch.randn((n,Xn.shape[1]),generator=generator,device=Xn.device,dtype=Xn.dtype)
+    z=torch.randn((n,Xn.shape[1]),generator=generator,device=Xn.device,dtype=Xn.dtype) if z0 is None else z0
     ts=torch.linspace(t_min,1.0,steps+1).tolist()
     for t,t_next in zip(ts[:-1],ts[1:]):
         if kind=="wiener":
@@ -185,18 +188,19 @@ def locality_sample(n:int,Xn:torch.Tensor,stats:tuple,kind:str="locality",tau:fl
 @torch.no_grad()
 def locality_sample_shrunk(groups:list,lam:torch.Tensor,Q:torch.Tensor,shrinkage:float,ridge:float=0.0,kind:str="locality",
                            tau:float=0.02,steps:int=10,t_min:float=1e-3,w:float=0.0,generator:torch.Generator=None,
-                           chunk:int=256)->list:
+                           chunk:int=256,z0s:list=None)->list:
     '''
     locality_sample for several nodes at once with shrinkage toward the global covariance, via ShrunkNode.
     all nodes step through the same time grid together, so the shared global part of the Wiener matrix is
     built once per step (one d x d x d matmul) instead of one eigendecomposition per node
     groups: list of (Xn, n_samples, log_prior or None); returns a list of (n_samples, d) tensors
+    z0s: optional list of starting noise per group (default: drawn from generator)
     '''
     if not groups:
         return []
     nodes=[ShrunkNode(Xn,lam,Q,shrinkage,ridge) for Xn,_,_ in groups]
     rho=ridge*lam.sum().item()/lam.shape[0]
-    zs=[torch.randn((n,Xn.shape[1]),generator=generator,device=Xn.device,dtype=Xn.dtype) for Xn,n,_ in groups]
+    zs=list(z0s) if z0s is not None else [torch.randn((n,Xn.shape[1]),generator=generator,device=Xn.device,dtype=Xn.dtype) for Xn,n,_ in groups]
     ts=torch.linspace(t_min,1.0,steps+1).tolist()
     for t,t_next in zip(ts[:-1],ts[1:]):
         sigma2=((1-t)/t)**2

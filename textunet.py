@@ -60,3 +60,21 @@ class TextUNet(nn.Module):
         model=cls(**meta["model"])
         model.load_state_dict(torch.load(path+".pt",map_location=map_location,weights_only=True))
         return model,meta
+
+
+@torch.no_grad()
+def net_sample(model:TextUNet,z0:torch.Tensor,steps:int=10,t_min:float=1e-3,text:torch.Tensor=None,text_mask:torch.Tensor=None)->torch.Tensor:
+    '''
+    Euler on the learned velocity from z0 (noise at t_min) to t = 1, on the same time grid as the closed-form
+    samplers (locality.py, els.py), so analytical and trained samples from the same z0 are comparable.
+    text: (B,text_dim); defaults to zeros for an --unconditional model
+    '''
+    B=z0.shape[0]
+    if text is None:
+        text=torch.zeros(B,model.config["text_dim"],device=z0.device)
+    ts=torch.linspace(t_min,1.0,steps+1).tolist()
+    z=z0
+    for t,t_next in zip(ts[:-1],ts[1:]):
+        v=model(z,torch.full((B,),t,device=z.device),text,text_mask)
+        z=z+(t_next-t)*v
+    return z
