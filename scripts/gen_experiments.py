@@ -4,8 +4,8 @@
 #   celebahq_ldm     same data in the VQ latents (3x64x64) of CompVis/ldm-celebahq-256, nets from that LDM
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
-# usage: python scripts/gen_experiments.py build|train|sample|agreement|summarize [setting ...]
-# each stage needs the previous one to finish (sample's analytical runs only need build)
+# usage: python scripts/gen_experiments.py build|train|sample_tree|sample_nets|agreement|summarize [setting ...]
+# (sample = sample_tree + sample_nets); sample_tree only needs build, sample_nets and agreement need train
 # make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tree slurm_chip/train slurm_chip/sample slurm_chip/agreement
 # FID/KID need torch-fidelity in the cluster env: pip install torch-fidelity
 import sys
@@ -81,7 +81,7 @@ for name in settings:
     if stage in ["train","all"]:
         for kind,flags in train_flags.items():
             print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {cfg['train']}"))
-    if stage in ["sample","all"]:
+    if stage in ["sample","sample_tree","all"]:
         for depth in cfg["depths"]:
             for method in cfg["methods"]:
                 if depth==99 and method!="cfdm":
@@ -90,6 +90,7 @@ for name in settings:
                 run=f"{name}_{method}_L{depth}" if depth!=99 else f"{name}_retrieval"
                 extra=cfg.get("extra",{}).get(method,"")
                 print(sbatch(f"{method}_L{depth}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} --output_dir outputs/{run}"))
+    if stage in ["sample","sample_nets","all"]:
         for kind,spec in nets.items():
             # the as-is checkpoint is unconditional, so only w=0 means anything; the cross-attention nets use w as the CFG scale
             ws="0" if kind=="pretrained" else "0 1 4"
