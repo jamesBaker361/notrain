@@ -192,13 +192,16 @@ def locality_sample_shrunk(groups:list,lam:torch.Tensor,Q:torch.Tensor,shrinkage
     built once per step (one d x d x d matmul) instead of one eigendecomposition per node
     groups: list of (Xn, n_samples, log_prior or None); returns a list of (n_samples, d) tensors
     '''
+    if not groups:
+        return []
     nodes=[ShrunkNode(Xn,lam,Q,shrinkage,ridge) for Xn,_,_ in groups]
+    rho=ridge*lam.sum().item()/lam.shape[0]
     zs=[torch.randn((n,Xn.shape[1]),generator=generator,device=Xn.device,dtype=Xn.dtype) for Xn,n,_ in groups]
     ts=torch.linspace(t_min,1.0,steps+1).tolist()
     for t,t_next in zip(ts[:-1],ts[1:]):
         sigma2=((1-t)/t)**2
         if kind=="locality":
-            dvec=shrinkage*lam+nodes[0].rho+sigma2
+            dvec=shrinkage*lam+rho+sigma2
             W_global=(Q*(1-sigma2/dvec))@Q.T
         for j,((Xn,_,log_prior),node) in enumerate(zip(groups,nodes)):
             z=zs[j]
