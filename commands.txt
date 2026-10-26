@@ -1,0 +1,55 @@
+What to run now, in order. Each `python scripts/gen_experiments.py <stage>` prints sbatch commands;
+piping it into bash submits them (drop "| bash" to see them first).
+
+==========================================================================================
+1. On your laptop: commit and push everything
+==========================================================================================
+cd ~/Desktop/notrain
+git add README.md .gitignore commands.txt bank.py caption.py cfdm.py compare.py els.py embed.py locality.py sample.py summarize.py textunet.py train.py tree.py agreement.py finetune.py metrics.py pretrained.py prompts/ scripts/ test_els.py test_locality.py test_metrics.py test_pretrained.py test_tree.py
+git commit -m "CLIP tree samplers, pretrained DDPM/LDM baselines with cross-attention, low-rank Wiener, evaluation metrics, standard datasets" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git push origin main
+
+==========================================================================================
+2. On the cluster: one-time setup
+==========================================================================================
+cd /umbc/rs/pi_donengel/users/jbaker15/notrain
+git pull
+git submodule update --init
+conda activate p11
+pip install torch-fidelity
+mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tree slurm_chip/train slurm_chip/sample slurm_chip/agreement
+
+==========================================================================================
+3. Build banks and trees (embed -> BLIP captions for CelebA-HQ -> tree, chained automatically)
+==========================================================================================
+python scripts/gen_experiments.py build | bash
+# wait until the tree_* jobs finish:  squeue -u $USER   (outputs in banks/)
+
+==========================================================================================
+4. Start training (fine-tuned + from-scratch nets, all three settings) and the tree runs together
+==========================================================================================
+python scripts/gen_experiments.py train | bash
+python scripts/gen_experiments.py sample_tree | bash
+# tree runs only need step 3; training takes much longer (50k steps each)
+
+==========================================================================================
+5. After training finishes (weights/<setting>_ft/ema.pt and weights/<setting>_scratch/ema.pt exist)
+==========================================================================================
+python scripts/gen_experiments.py sample_nets | bash
+python scripts/gen_experiments.py agreement | bash
+
+==========================================================================================
+6. After all sample jobs finish: tables and comparison images
+==========================================================================================
+python scripts/gen_experiments.py summarize | bash
+# results: outputs/summary_<setting>/summary.md and outputs/agreement_<setting>/agreement.md
+
+==========================================================================================
+Notes
+==========================================================================================
+- One setting only: add its name, e.g.  python scripts/gen_experiments.py build cifar10_pix32 | bash
+  (settings: cifar10_pix32, celebahq_pix256, celebahq_ldm)
+- First jobs download the checkpoints, DINOv2, CLIP ViT-B/16 and the LPIPS AlexNet weights.
+- Check a job:  tail -f slurm_chip/<stage>/<name>.out   (errors in the matching .err)
+- If training is too slow, lower --max_steps in the SETTINGS "train" entries of scripts/gen_experiments.py.
+- Local tests (laptop):  KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 python -m pytest -q test_*.py
