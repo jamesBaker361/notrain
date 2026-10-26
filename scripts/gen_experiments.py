@@ -44,6 +44,9 @@ SETTINGS={
     },
 }
 settings=sys.argv[2:] or list(SETTINGS)
+STAGES=["build","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
+if stage not in STAGES or any(s not in SETTINGS for s in settings):
+    sys.exit(f"usage: python scripts/gen_experiments.py <stage> [setting ...]\n  stages: {' '.join(STAGES)}\n  settings: {' '.join(SETTINGS)}\n  got stage={stage!r} settings={settings}")
 
 branching="silhouette"
 # --c_search 1 so the descent only stops at the depth cutoff (or at a leaf); depth 0 = no tree (the paper's setting),
