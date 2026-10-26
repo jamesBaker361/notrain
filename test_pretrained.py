@@ -81,3 +81,20 @@ def test_trained_net_unconditional_uses_empty_caption(tmp_path):
     null_text,null_mask=clip_fn([""])
     ref=diffusion_sample(tn.model,z0,2,tn.t_min,null_text.expand(2,-1,-1),null_mask.expand(2,-1),null_text.expand(2,-1,-1),null_mask.expand(2,-1),0.0)
     assert torch.allclose(out,ref,atol=1e-6)
+
+
+def test_celebahq_architecture_at_64(tmp_path):
+    # fully convolutional: the 256px celebahq UNet runs on 64x64 faces (bottom level 2x2)
+    net=DiffusionNet("google/ddpm-celebahq-256","scratch",cross_attention=True,token_dim=16,sample_size=64).eval()
+    assert net.unet.config.sample_size==64 and len(net.adapters)>0
+    with torch.no_grad():
+        out=net.x0(torch.randn(1,3,64,64),0.5,torch.randn(1,5,16),torch.ones(1,5),torch.zeros(1,5,16),torch.ones(1,5),w=2.0)
+    assert out.shape==(1,3,64,64) and torch.isfinite(out).all()
+    net.save(str(tmp_path/"m"))
+    loaded,meta=DiffusionNet.load(str(tmp_path/"m"))
+    assert meta["diffusion_net"]["sample_size"]==64 and loaded.unet.config.sample_size==64
+
+
+def test_sample_size_must_divide():
+    with pytest.raises(AssertionError):
+        DiffusionNet("google/ddpm-celebahq-256","scratch",sample_size=48)

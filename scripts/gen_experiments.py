@@ -2,6 +2,9 @@
 #   cifar10_pix32    uoft-cs/cifar10 (test split held out), pixels 32x32,   nets from google/ddpm-cifar10-32
 #   celebahq_pix256  korexyz/celeba-hq-256x256 (validation held out), pixels 256x256, nets from google/ddpm-celebahq-256
 #   celebahq_ldm     same data in the VQ latents (3x64x64) of CompVis/ldm-celebahq-256, nets from that LDM
+#   celebahq_pix64   same faces as pixels at 64x64 (the locality paper's setting); no 64px checkpoint exists, so the
+#                    nets are the celebahq-256 architecture run at 64x64 with cross-attention (from scratch, and
+#                    fine-tuned from the 256px weights)
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
 # usage: python scripts/gen_experiments.py build|train|sample_tree|sample_nets|agreement|summarize [setting ...]
@@ -42,6 +45,18 @@ SETTINGS={
         "methods":["cfdm","locality","wiener","ls"],
         "depths":[0,2,4,8,99],
     },
+    "celebahq_pix64":{
+        "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space pixel --resolution 64",
+        "blip":True,
+        "base":"google/ddpm-celebahq-256",
+        "sample_size":64,
+        "prompts":"prompts/celeb.txt",
+        "train":"--batch_size 64 --max_steps 100000",
+        "methods":["cfdm","locality","wiener","ls"],
+        "depths":[0,2,4,8,99],
+        # the 256px checkpoint as-is doesn't apply to 64px inputs
+        "nets":["ft","scratch"],
+    },
 }
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
@@ -73,6 +88,8 @@ for name in settings:
     bank=f"banks/{name}.pt"
     tree=f"banks/{name}_tree.pt"
     nets={"pretrained":f"pretrained:{cfg['base']}","ft":f"weights/{name}_ft/ema","scratch":f"weights/{name}_scratch/ema"}
+    nets={k:v for k,v in nets.items() if k in cfg.get("nets",nets)}
+    size=f"--sample_size {cfg['sample_size']}" if cfg.get("sample_size") else ""
     if stage in ["build","all"]:
         # embed -> (BLIP captions) -> tree, each waiting for the previous job
         embed_args=cfg["embed"]
@@ -83,7 +100,7 @@ for name in settings:
         print(line)
     if stage in ["train","all"]:
         for kind,flags in train_flags.items():
-            print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {cfg['train']}"))
+            print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {size} {cfg['train']}"))
     if stage in ["sample","sample_tree","all"]:
         for depth in cfg["depths"]:
             for method in cfg["methods"]:
@@ -101,6 +118,7 @@ for name in settings:
             print(sbatch(f"net_{kind}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method net --model {spec} --steps 50 --w {ws} {metrics} --output_dir outputs/{run}"))
     if stage in ["agreement","all"]:
         # target: the net trained from scratch on exactly our bank; the checkpoint and its fine-tune as "another DDPM"
-        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {nets['pretrained']} {nets['ft']} --methods {' '.join(['ideal']+cfg['methods'])} {cfg.get('extra',{}).get('wiener','')} --n 64 --output_dir outputs/agreement_{name}"))
+        others=" ".join(v for k,v in nets.items() if k!="scratch")
+        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {others} --methods {' '.join(['ideal']+cfg['methods'])} {cfg.get('extra',{}).get('wiener','')} --n 64 --output_dir outputs/agreement_{name}"))
     if stage in ["summarize","all"]:
         print(f"python summarize.py --runs 'outputs/{name}_*' --output_dir outputs/summary_{name}")

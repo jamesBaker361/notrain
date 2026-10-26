@@ -48,7 +48,7 @@ python scripts/gen_experiments.py summarize | bash
 Notes
 ==========================================================================================
 - One setting only: add its name, e.g.  python scripts/gen_experiments.py build cifar10_pix32 | bash
-  (settings: cifar10_pix32, celebahq_pix256, celebahq_ldm)
+  (settings: cifar10_pix32, celebahq_pix256, celebahq_ldm, celebahq_pix64)
 - First jobs download the checkpoints, DINOv2, CLIP ViT-B/16 and the LPIPS AlexNet weights.
 - Check a job:  tail -f slurm_chip/<stage>/<name>.out   (errors in the matching .err)
 - If training is too slow, lower --max_steps in the SETTINGS "train" entries of scripts/gen_experiments.py.

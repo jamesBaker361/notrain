@@ -25,6 +25,7 @@ parser=argparse.ArgumentParser()
 parser.add_argument("--bank",type=str,default="banks/cifar10_pix32.pt")
 parser.add_argument("--base",type=str,default="google/ddpm-cifar10-32",choices=list(BASES))
 parser.add_argument("--init",type=str,default="pretrained",choices=["pretrained","scratch"])
+parser.add_argument("--sample_size",type=int,default=0,help="run the base architecture at this resolution (e.g. 64 for celebahq-256 on 64px faces); 0 keeps the base's")
 parser.add_argument("--cross_attention",action="store_true",help="add text cross-attention adapters (needs bank captions)")
 parser.add_argument("--adapters_only",action="store_true",help="with --init pretrained, freeze the UNet and train only the adapters")
 parser.add_argument("--limit",type=int,default=-1)
@@ -76,7 +77,7 @@ def main(args):
             return torch.cat([cache[c][0] for c in texts]),torch.cat([cache[c][1] for c in texts])
         null_text,null_mask=encode_texts_clip_tokens(clip_model,clip_processor,[""],device)
 
-    model=DiffusionNet(args.base,args.init,args.cross_attention,token_dim)
+    model=DiffusionNet(args.base,args.init,args.cross_attention,token_dim,args.sample_size or None)
     assert tuple(model.unet.config.sample_size if isinstance(model.unet.config.sample_size,(list,tuple)) else [model.unet.config.sample_size]*2)==tuple(shape[1:]) and model.unet.config.in_channels==shape[0],\
         f"{args.base} expects {model.unet.config.in_channels}x{model.unet.config.sample_size} inputs but the bank is {shape}"
     if args.gradient_checkpointing:
