@@ -42,6 +42,8 @@ SETTINGS={
         "base":"CompVis/ldm-celebahq-256",
         "prompts":"prompts/celeb.txt",
         "train":"--batch_size 16 --gradient_checkpointing --max_steps 50000",
+        # the LDM UNet (274M parameters) trains on the bigger GPU nodes
+        "train_script":"runpygpu_chip_heavy.sh",
         "methods":["cfdm","locality","wiener","ls"],
         "depths":[0,2,4,8,99],
     },
@@ -78,9 +80,9 @@ method_flags={
 train_flags={"ft":"--init pretrained --cross_attention --lr 2e-5","scratch":"--init scratch --cross_attention --lr 1e-4"}
 
 
-def sbatch(job:str,log:str,cmd:str,dependency:str="")->str:
+def sbatch(job:str,log:str,cmd:str,dependency:str="",script:str="runpygpu_chip.sh")->str:
     dep=f"--dependency=afterok:{dependency} " if dependency else ""
-    return f"sbatch --parsable {dep}-J {job} --err=slurm_chip/{log}.err --out=slurm_chip/{log}.out runpygpu_chip.sh {cmd}"
+    return f"sbatch --parsable {dep}-J {job} --err=slurm_chip/{log}.err --out=slurm_chip/{log}.out {script} {cmd}"
 
 
 for name in settings:
@@ -100,7 +102,8 @@ for name in settings:
         print(line)
     if stage in ["train","all"]:
         for kind,flags in train_flags.items():
-            print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {size} {cfg['train']}"))
+            print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {size} {cfg['train']}",
+                         script=cfg.get("train_script","runpygpu_chip.sh")))
     if stage in ["sample","sample_tree","all"]:
         for depth in cfg["depths"]:
             for method in cfg["methods"]:
