@@ -227,3 +227,33 @@ def test_wiener_lowrank_sampler(shrink_data):
     stats=LowRankWiener(low_rank_cov(Xall[:20].float(),4,"cpu"),low_rank_cov(Xall.float(),4,"cpu"),0.5,0.01)
     out=wiener_lowrank_sample(5,stats,steps=10,generator=g)
     assert out.shape==(5,10) and torch.isfinite(out).all()
+
+
+def test_shrunk_node_with_more_images_than_dims_avoids_n_by_n(shrink_data):
+    # depth 0 / big nodes: n > d uses the d x d eigendecomposition (Woodbury would solve an n x n system)
+    Xall,S_global,(lam,Q),g=shrink_data
+    node=ShrunkNode(Xall,lam,Q,0.5,0.05)
+    assert node.exact is not None and not hasattr(node,"U")
+    exact=node_eig(Xall,S_global,0.5,0.05)
+    r=torch.randn(3,10,generator=g,dtype=torch.float64)
+    for s2 in [1e-2,1.0,30.0]:
+        W=wiener_matrix(exact[1],exact[2],s2,exact[3])
+        assert torch.allclose(node.wiener_matrix(s2),W,atol=1e-8)
+        assert torch.allclose(node.wiener_apply(r,s2),r@W.T,atol=1e-8)
+    small=ShrunkNode(Xall[:5],lam,Q,0.5,0.05)
+    assert small.exact is None and small.U.shape==(10,5)
+
+
+def test_tree_sample_woodbury_caches_nodes():
+    g=torch.Generator().manual_seed(0)
+    T=torch.nn.functional.normalize(torch.randn(60,6,generator=g),dim=-1)
+    X=torch.randn(60,8,generator=g)
+    tree=add_node_stats(build_tree(T,pca_dim=4,branching="3",c_build=10,n_init=1),X,T)
+    spectrum=global_spectrum(torch.cov(X.T))
+    cache={}
+    kwargs={"tau":0.02,"steps":3,"shrinkage":0.5,"ridge":0.0,"spectrum":spectrum,"cache":cache}
+    # depth 0: one node, the whole bank (60 images > 8 dims), built once and reused
+    tree_sample(tree,X,T[0],4,w=1.0,logit_scale=10.0,max_depth=0,c_search=1,node_sampler="locality",generator=g,locality_kwargs=kwargs)
+    first=dict(cache)
+    tree_sample(tree,X,T[0],4,w=1.0,logit_scale=10.0,max_depth=0,c_search=1,node_sampler="wiener",generator=g,locality_kwargs=kwargs)
+    assert len(first)==1 and all(cache[k] is first[k] for k in first) and next(iter(first.values())).exact is not None

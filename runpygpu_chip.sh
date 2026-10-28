@@ -61,6 +61,8 @@ export CLIP_CACHE="/umbc/rs/pi_donengel/users/jbaker15/clip_cache"
 export SDL_VIDEODRIVER=dummy
 export XDG_RUNTIME_DIR="/umbc/rs/pi_donengel/users/jbaker15/xdg_runtime"
 export TMPDIR="/umbc/rs/pi_donengel/users/jbaker15/tmp"
+# flush prints immediately so a killed job's .out still shows how far it got
+export PYTHONUNBUFFERED=1
 echo "Running on: $(hostname)"
 echo "Allocated GPUs:"
 nvidia-smi

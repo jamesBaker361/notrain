@@ -167,3 +167,16 @@ def test_deep_single_linkage_chain_builds():
     tree=build_tree(T,pca_dim=2,c_build=1,method="agglomerative",linkage="single")
     assert int(tree["depth"].max())>1000
     check_structure(tree,N,c_build=1)
+
+
+def test_node_stats_from_float16_bank_and_optional():
+    X,T,centers,labels=clustered_bank()
+    tree=build_tree(T,pca_dim=8,branching="4",c_build=10,n_init=2)
+    full=add_node_stats(dict(tree),X,T)
+    half=add_node_stats(dict(tree),X.half(),T,chunk=7)
+    assert torch.allclose(full["vae_mean"],half["vae_mean"],atol=2e-2) and torch.allclose(full["vae_var"],half["vae_var"],rtol=2e-2,atol=2e-2)
+    skipped=add_node_stats(dict(tree),X,T,max_bytes=1)
+    assert skipped["vae_mean"] is None and torch.allclose(skipped["clip_mean"],full["clip_mean"])
+    node=skipped["children"][0][0]
+    out=sample_node(skipped,X,node,4,"diagonal",torch.Generator().manual_seed(0))
+    assert out.shape==(4,X.shape[1]) and torch.isfinite(out).all()

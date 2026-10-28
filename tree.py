@@ -38,6 +38,7 @@ parser.add_argument("--cluster_method",type=str,default="kmeans",choices=["kmean
 parser.add_argument("--dbscan_min_samples",type=int,default=5,help="dbscan: min_samples, and the neighbor whose distance sets eps")
 parser.add_argument("--dbscan_quantile",type=float,default=0.5,help="dbscan: eps = this quantile of each node's min_samples-th-neighbor distances")
 parser.add_argument("--dbscan_noise",type=str,default="nearest",choices=["nearest","group"],help="dbscan: noise points join their nearest cluster, or form one extra child")
+parser.add_argument("--vae_stats",type=str,default="auto",choices=["auto","yes","no"],help="store per-node mean/variance of the bank vectors (diagonal sampler only); auto skips them when over 4GB")
 parser.add_argument("--linkage",type=str,default="ward",choices=["ward","average","complete","single"],help="agglomerative: scipy linkage method")
 parser.add_argument("--seed",type=int,default=123)
 
@@ -202,12 +203,15 @@ def build_tree(T:torch.Tensor,pca_dim:int=64,branching:str="10",k_min:int=2,k_ma
     }
 
 
-def add_node_stats(tree:dict,X:torch.Tensor,T:torch.Tensor)->dict:
+def add_node_stats(tree:dict,X:torch.Tensor,T:torch.Tensor,vae_stats:str="auto",max_bytes:float=4e9,chunk:int=4096)->dict:
     '''
-    mean CLIP embedding per node (full and PCA coords), and VAE latent mean/variance per internal node
+    mean CLIP embedding per node (full and PCA coords), and the mean/variance of the members' bank vectors per
+    internal node (only the diagonal node sampler uses those). X may be a large float16 bank: the stats are
+    accumulated over row chunks, never converting the whole bank. vae_stats "auto" stores them only if they fit in
+    max_bytes (a 256px pixel bank's ~9k internal nodes x 196608 dims would be ~14GB); without them the diagonal
+    sampler computes them from the node's images
     '''
     perm,start,end=tree["perm"],tree["start"],tree["end"]
-    X_perm=X[perm].float()
     T_perm=T[perm].float()
     # members are contiguous in perm, so each node is a slice; every image appears once per tree level
     clip_mean=torch.stack([T_perm[s:e].mean(0) for s,e in zip(start.tolist(),end.tolist())])
@@ -215,10 +219,25 @@ def add_node_stats(tree:dict,X:torch.Tensor,T:torch.Tensor)->dict:
     internal_ids=internal.nonzero().squeeze(-1)
     internal_index=torch.full((len(start),),-1,dtype=torch.long)
     internal_index[internal_ids]=torch.arange(len(internal_ids))
-    vae_mean=torch.empty(len(internal_ids),X.shape[1])
-    vae_var=torch.empty(len(internal_ids),X.shape[1])
-    for k,node in enumerate(internal_ids.tolist()):
-        vae_var[k],vae_mean[k]=torch.var_mean(X_perm[start[node]:end[node]],dim=0)
+    store=vae_stats=="yes" or (vae_stats=="auto" and 2*len(internal_ids)*X.shape[1]*4<=max_bytes)
+    vae_mean=vae_var=None
+    if store:
+        vae_mean=torch.empty(len(internal_ids),X.shape[1])
+        vae_var=torch.empty(len(internal_ids),X.shape[1])
+        for k,node in enumerate(internal_ids.tolist()):
+            rows=perm[start[node]:end[node]]
+            total=torch.zeros(X.shape[1],dtype=torch.float64)
+            total_sq=torch.zeros(X.shape[1],dtype=torch.float64)
+            for i in range(0,len(rows),chunk):
+                x=X[rows[i:i+chunk]].double()
+                total+=x.sum(0)
+                total_sq+=x.pow(2).sum(0)
+            n=len(rows)
+            mean=total/n
+            vae_mean[k]=mean.float()
+            vae_var[k]=((total_sq/n-mean.pow(2)).clamp_min(0)*n/max(n-1,1)).float()
+    else:
+        print(f"not storing per-node mean/variance ({len(internal_ids)} internal nodes x {X.shape[1]} dims); the diagonal sampler computes them on the fly")
     tree["clip_mean"]=clip_mean
     tree["clip_mean_pca"]=(clip_mean-tree["pca_mean"])@tree["pca_components"].T
     tree["vae_mean"]=vae_mean
@@ -284,6 +303,9 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
     if Xn.shape[0]==1:
         return Xn.expand(n,-1).clone()
     if node_sampler=="diagonal":
+        if tree.get("vae_mean") is None:
+            var,mean=torch.var_mean(Xn,dim=0)
+            return mean+var.sqrt()*randn(n,X.shape[1])
         k=int(tree["internal_index"][node])
         mean=tree["vae_mean"][k].to(device)
         std=tree["vae_var"][k].to(device).sqrt()
@@ -347,17 +369,30 @@ def tree_sample(tree:dict,X:torch.Tensor,text_embed:torch.Tensor,n:int,w:float,l
     kwargs=locality_kwargs or {}
     if node_sampler in ["locality","wiener"] and kwargs.get("spectrum") is not None and kwargs.get("shrinkage",0)>0 and not kwargs.get("wiener_rank"):
         # Woodbury path: all non-leaf nodes step together and share the global part of the Wiener matrix
-        from locality import locality_sample_shrunk
+        from locality import locality_sample_shrunk,ShrunkNode
         lam,Q=kwargs["spectrum"]
         log_prior=kwargs.get("log_prior")
+        cache=kwargs.get("cache")
         inner=[node for node in groups if node_size(tree,node)>1]
         batch=[]
+        shrunk=[]
         for node in inner:
             members=node_members(tree,node)
             lp=None if log_prior is None else torch.log_softmax(log_prior[members.to(log_prior.device)].to(device),dim=-1)
-            batch.append((X[members.to(X.device)].to(device).float(),len(groups[node]),lp))
+            Xn=X[members.to(X.device)].to(device).float()
+            batch.append((Xn,len(groups[node]),lp))
+            # node statistics are reused across prompts, w and FID batches (big nodes eigendecompose once)
+            key=("shrunk",node,kwargs["shrinkage"],kwargs.get("ridge",0.0))
+            if cache is None or key not in cache:
+                built=ShrunkNode(Xn,lam,Q,kwargs["shrinkage"],kwargs.get("ridge",0.0))
+                if cache is None:
+                    shrunk.append(built)
+                    continue
+                cache[key]=built
+            shrunk.append(cache[key])
         outs=locality_sample_shrunk(batch,lam,Q,kwargs["shrinkage"],kwargs.get("ridge",0.0),node_sampler,
-                                    kwargs.get("tau",0.02),kwargs.get("steps",10),w=kwargs.get("w",0.0),generator=generator)
+                                    kwargs.get("tau",0.02),kwargs.get("steps",10),w=kwargs.get("w",0.0),generator=generator,
+                                    nodes=shrunk)
         for node,o in zip(inner,outs):
             out[groups[node]]=o
         for node in groups:
@@ -376,7 +411,7 @@ def main(args):
     start=time.time()
     tree=build_tree(T,args.pca_dim,args.branching,args.k_min,args.k_max,args.silhouette_sample,args.c_build,args.n_init,args.seed,
                     args.cluster_method,args.dbscan_min_samples,args.dbscan_quantile,args.linkage,args.dbscan_noise)
-    tree=add_node_stats(tree,X,T)
+    tree=add_node_stats(tree,X,T,args.vae_stats)
     tree["bank"]=args.bank
     tree["args"]=vars(args)
     n_nodes=len(tree["children"])

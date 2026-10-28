@@ -68,14 +68,25 @@ class ShrunkNode:
     Woodbury: M^-1 = A^-1 - B K^-1 B^T with B = A^-1 U, K = I/c + U^T B (n x n), and W = S M^-1 = I - sigma2 M^-1:
         W = W_global + sigma2 B K^-1 B^T,   W_global = Q diag(1 - sigma2/(shrinkage*lam + rho + sigma2)) Q^T
     exact (same W as node_eig with the same shrinkage and ridge); per node per step it costs ~d^2 n instead of d^3
+    Woodbury only pays off when the node has fewer images than dimensions (it solves an n x n system). A node with
+    n > d (e.g. depth 0, the whole bank) instead eigendecomposes its d x d blended covariance once, which gives the
+    same W; build the node once and reuse it (tree_sample caches nodes) since that decomposition is the expensive part
     '''
     def __init__(self,Xn:torch.Tensor,lam:torch.Tensor,Q:torch.Tensor,shrinkage:float,ridge:float=0.0):
         n,d=Xn.shape
         self.mean=Xn.mean(0)
+        self.rho=ridge*lam.sum().item()/d
+        self.exact=None
+        if n>d:
+            Xc=Xn-self.mean
+            S=(1-shrinkage)*(Xc.T@Xc)/(n-1)+shrinkage*(Q*lam)@Q.T
+            S.diagonal().add_(self.rho)
+            evals,evecs=torch.linalg.eigh(S)
+            self.exact=(evals.clamp_min(0),evecs)
+            return
         self.U=(Xn-self.mean).T
         self.c=(1-shrinkage)/(n-1) if n>1 else 0.0
         self.lam,self.Q,self.shrinkage=lam,Q,shrinkage
-        self.rho=ridge*lam.sum().item()/d
 
     def global_diag(self,sigma2:float)->torch.Tensor:
         return self.shrinkage*self.lam+self.rho+sigma2
@@ -89,6 +100,8 @@ class ShrunkNode:
         return dvec,B,torch.linalg.inv(K).to(B.dtype)
 
     def wiener_matrix(self,sigma2:float,W_global:torch.Tensor=None)->torch.Tensor:
+        if self.exact is not None:
+            return wiener_matrix(*self.exact,sigma2)
         dvec,B,Kinv=self.factors(sigma2)
         if W_global is None:
             W_global=(self.Q*(1-sigma2/dvec))@self.Q.T
@@ -97,6 +110,9 @@ class ShrunkNode:
         return W_global+sigma2*(B@Kinv)@B.T
 
     def wiener_apply(self,r:torch.Tensor,sigma2:float)->torch.Tensor:
+        if self.exact is not None:
+            evals,evecs=self.exact
+            return ((r@evecs)*(evals/(evals+sigma2)))@evecs.T
         '''
         W r for rows r (m,d), with no d x d matrix
         '''
@@ -188,23 +204,27 @@ def locality_sample(n:int,Xn:torch.Tensor,stats:tuple,kind:str="locality",tau:fl
 @torch.no_grad()
 def locality_sample_shrunk(groups:list,lam:torch.Tensor,Q:torch.Tensor,shrinkage:float,ridge:float=0.0,kind:str="locality",
                            tau:float=0.02,steps:int=10,t_min:float=1e-3,w:float=0.0,generator:torch.Generator=None,
-                           chunk:int=256,z0s:list=None)->list:
+                           chunk:int=256,z0s:list=None,nodes:list=None)->list:
     '''
     locality_sample for several nodes at once with shrinkage toward the global covariance, via ShrunkNode.
     all nodes step through the same time grid together, so the shared global part of the Wiener matrix is
     built once per step (one d x d x d matmul) instead of one eigendecomposition per node
     groups: list of (Xn, n_samples, log_prior or None); returns a list of (n_samples, d) tensors
     z0s: optional list of starting noise per group (default: drawn from generator)
+    nodes: optional prebuilt ShrunkNode per group (reused across calls; built here otherwise)
     '''
     if not groups:
         return []
-    nodes=[ShrunkNode(Xn,lam,Q,shrinkage,ridge) for Xn,_,_ in groups]
+    if nodes is None:
+        nodes=[ShrunkNode(Xn,lam,Q,shrinkage,ridge) for Xn,_,_ in groups]
     rho=ridge*lam.sum().item()/lam.shape[0]
     zs=list(z0s) if z0s is not None else [torch.randn((n,Xn.shape[1]),generator=generator,device=Xn.device,dtype=Xn.dtype) for Xn,n,_ in groups]
     ts=torch.linspace(t_min,1.0,steps+1).tolist()
     for t,t_next in zip(ts[:-1],ts[1:]):
         sigma2=((1-t)/t)**2
-        if kind=="locality":
+        W_global=None
+        if kind=="locality" and any(node.exact is None for node in nodes):
+            # shared by the Woodbury nodes; nodes with more images than dimensions use their own exact W
             dvec=shrinkage*lam+rho+sigma2
             W_global=(Q*(1-sigma2/dvec))@Q.T
         for j,((Xn,_,log_prior),node) in enumerate(zip(groups,nodes)):

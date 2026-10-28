@@ -20,6 +20,7 @@ parser.add_argument("--captioner",type=str,default="Salesforce/blip-image-captio
 parser.add_argument("--prompt",type=str,default="",help="optional caption prefix for conditional captioning, e.g. 'a photo of'")
 parser.add_argument("--max_new_tokens",type=int,default=40)
 parser.add_argument("--num_beams",type=int,default=3)
+parser.add_argument("--no_repeat_ngram_size",type=int,default=3,help="block repeated n-grams (BLIP otherwise sometimes loops, e.g. 'mustache mustache mustache')")
 parser.add_argument("--batch_size",type=int,default=32)
 parser.add_argument("--mixed_precision",type=str,default="fp16",choices=["no","fp16","bf16"])
 
@@ -55,7 +56,7 @@ def main(args):
             inputs=processor(images=images,return_tensors="pt").to(device)
         inputs["pixel_values"]=inputs["pixel_values"].to(torch_dtype)
         with torch.no_grad():
-            out=captioner.generate(**inputs,max_new_tokens=args.max_new_tokens,num_beams=args.num_beams)
+            out=captioner.generate(**inputs,max_new_tokens=args.max_new_tokens,num_beams=args.num_beams,no_repeat_ngram_size=args.no_repeat_ngram_size)
         captions+=[c.strip() for c in processor.batch_decode(out,skip_special_tokens=True)]
         if (start//args.batch_size)%20==0:
             print(f"\t captioned {len(captions)}/{len(dataset)}: {captions[-1]}")
