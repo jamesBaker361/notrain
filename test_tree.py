@@ -114,3 +114,56 @@ def test_tree_sample(built):
                           node_sampler="lowrank",generator=torch.Generator().manual_seed(0))
     assert out.shape==(8,X.shape[1]) and len(nodes)==8
     assert all(set(labels[node_members(tree,m)].tolist())=={2} for m in nodes)
+
+
+def check_structure(tree,N,c_build=10):
+    assert sorted(tree["perm"].tolist())==list(range(N))
+    for node,kids in enumerate(tree["children"]):
+        if not kids:
+            assert node_size(tree,node)==1
+            continue
+        assert tree["start"][kids[0]]==tree["start"][node] and tree["end"][kids[-1]]==tree["end"][node]
+        for a,b in zip(kids[:-1],kids[1:]):
+            assert tree["end"][a]==tree["start"][b]
+        assert all(tree["parent"][k]==node and tree["depth"][k]==tree["depth"][node]+1 for k in kids)
+        if node_size(tree,node)<=c_build:
+            assert len(kids)==node_size(tree,node)
+
+
+@pytest.mark.parametrize("method,kwargs",[("dbscan",{}),("agglomerative",{"linkage":"ward"}),("agglomerative",{"linkage":"average"})])
+def test_other_cluster_methods_structure_and_stats(method,kwargs):
+    X,T,centers,labels=clustered_bank()
+    tree=add_node_stats(build_tree(T,pca_dim=8,c_build=10,method=method,**kwargs),X,T)
+    assert tree["cluster_method"]==method
+    check_structure(tree,X.shape[0])
+    for node in range(len(tree["children"])):
+        members=node_members(tree,node)
+        assert torch.allclose(tree["clip_mean"][node],T[members].mean(0),atol=1e-5)
+
+
+@pytest.mark.parametrize("method",["dbscan","agglomerative"])
+def test_other_cluster_methods_find_the_clusters(method):
+    # every planted cluster is exactly the image set of some node
+    X,T,centers,labels=clustered_bank()
+    tree=build_tree(T,pca_dim=8,c_build=10,method=method)
+    node_sets={frozenset(node_members(tree,n).tolist()) for n in range(len(tree["children"]))}
+    for c in range(4):
+        assert frozenset((labels==c).nonzero().squeeze(-1).tolist()) in node_sets
+
+
+def test_agglomerative_is_binary_above_c_build():
+    X,T,centers,labels=clustered_bank()
+    tree=build_tree(T,pca_dim=8,c_build=10,method="agglomerative")
+    for node,kids in enumerate(tree["children"]):
+        if node_size(tree,node)>10:
+            assert len(kids)==2
+
+
+def test_deep_single_linkage_chain_builds():
+    # points on a line with growing gaps: single linkage makes a chain deeper than Python's recursion limit
+    N=1500
+    T=torch.zeros(N,4)
+    T[:,0]=torch.cumsum(torch.linspace(1,2,N),0)
+    tree=build_tree(T,pca_dim=2,c_build=1,method="agglomerative",linkage="single")
+    assert int(tree["depth"].max())>1000
+    check_structure(tree,N,c_build=1)

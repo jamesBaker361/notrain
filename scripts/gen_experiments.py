@@ -7,10 +7,12 @@
 #                    fine-tuned from the 256px weights)
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
-# usage: python scripts/gen_experiments.py build|train|sample_tree|sample_nets|agreement|summarize [setting ...]
+# usage: python scripts/gen_experiments.py build|tree|train|sample_tree|sample_nets|agreement|summarize [setting ...]
+# (tree = only the tree jobs, for banks that already exist, e.g. after adding to cluster_methods)
 # (sample = sample_tree + sample_nets); sample_tree only needs build, sample_nets and agreement need train
 # make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tree slurm_chip/train slurm_chip/sample slurm_chip/agreement
 # FID/KID need torch-fidelity in the cluster env: pip install torch-fidelity
+import os
 import sys
 stage=sys.argv[1] if len(sys.argv)>1 else "all"
 
@@ -61,11 +63,17 @@ SETTINGS={
     },
 }
 settings=sys.argv[2:] or list(SETTINGS)
-STAGES=["build","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
+STAGES=["build","tree","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
     sys.exit(f"usage: python scripts/gen_experiments.py <stage> [setting ...]\n  stages: {' '.join(STAGES)}\n  settings: {' '.join(SETTINGS)}\n  got stage={stage!r} settings={settings}")
 
-branching="silhouette"
+# trees to build and sample; kmeans keeps the original file/run names, others get a _<method> suffix
+cluster_methods=["kmeans"]
+cluster_flags={
+    "kmeans":"--cluster_method kmeans --branching silhouette",
+    "dbscan":"--cluster_method dbscan --dbscan_min_samples 5 --dbscan_quantile 0.5",
+    "agglomerative":"--cluster_method agglomerative --linkage ward",
+}
 # --c_search 1 so the descent only stops at the depth cutoff (or at a leaf); depth 0 = no tree (the paper's setting),
 # depth 99 = always a single-image leaf, i.e. a CLIP-guided retrieval baseline
 # CLIP score uses a different CLIP than the one conditioning the descent (the bank's ViT-L/14)
@@ -80,6 +88,11 @@ method_flags={
 train_flags={"ft":"--init pretrained --cross_attention --lr 2e-5","scratch":"--init scratch --cross_attention --lr 1e-4"}
 
 
+def finished(run_dir:str,result:str="metrics.json")->bool:
+    # runs with results already on disk are not resubmitted (skipped silently), so re-running a stage only submits what's missing
+    return os.path.exists(os.path.join(run_dir,result))
+
+
 def sbatch(job:str,log:str,cmd:str,dependency:str="",script:str="runpygpu_chip.sh")->str:
     dep=f"--dependency=afterok:{dependency} " if dependency else ""
     return f"sbatch --parsable {dep}-J {job} --err=slurm_chip/{log}.err --out=slurm_chip/{log}.out {script} {cmd}"
@@ -88,7 +101,8 @@ def sbatch(job:str,log:str,cmd:str,dependency:str="",script:str="runpygpu_chip.s
 for name in settings:
     cfg=SETTINGS[name]
     bank=f"banks/{name}.pt"
-    tree=f"banks/{name}_tree.pt"
+    trees={m:(f"banks/{name}_tree.pt" if m=="kmeans" else f"banks/{name}_tree_{m}.pt") for m in cluster_methods}
+    tree_jobs=[(f"tree_{name}_{m}",f"tree/{name}_{m}",f"tree.py --bank {bank} --save_path {path} {cluster_flags[m]}") for m,path in trees.items()]
     nets={"pretrained":f"pretrained:{cfg['base']}","ft":f"weights/{name}_ft/ema","scratch":f"weights/{name}_scratch/ema"}
     nets={k:v for k,v in nets.items() if k in cfg.get("nets",nets)}
     size=f"--sample_size {cfg['sample_size']}" if cfg.get("sample_size") else ""
@@ -98,28 +112,42 @@ for name in settings:
         line=f"jid=$({sbatch('embed_'+name,'embed/'+name,f'embed.py {embed_args} --save_path {bank}')})"
         if cfg["blip"]:
             line+=f" && jid=$({sbatch('caption_'+name,'caption/'+name,f'caption.py --bank {bank}','$jid')})"
-        line+=f" && {sbatch('tree_'+name,'tree/'+name,f'tree.py --bank {bank} --save_path {tree} --branching {branching}','$jid')}"
+        for job,log,cmd in tree_jobs:
+            line+=f" && {sbatch(job,log,cmd,'$jid')}"
         print(line)
+    if stage=="tree":
+        # trees only, for a bank that already exists (e.g. adding a clustering method)
+        for job,log,cmd in tree_jobs:
+            print(sbatch(job,log,cmd))
     if stage in ["train","all"]:
         for kind,flags in train_flags.items():
             print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {size} {cfg['train']}",
                          script=cfg.get("train_script","runpygpu_chip.sh")))
     if stage in ["sample","sample_tree","all"]:
-        for depth in cfg["depths"]:
-            for method in cfg["methods"]:
-                if depth==99 and method!="cfdm":
-                    # every sampler returns the leaf's image, so one retrieval run is enough
+        for cm,tree in trees.items():
+            suffix="" if cm=="kmeans" else f"_{cm}"
+            for depth in cfg["depths"]:
+                if depth==0 and cm!=cluster_methods[0]:
+                    # depth 0 is the whole bank whatever the tree, so it only runs once
                     continue
-                run=f"{name}_{method}_L{depth}" if depth!=99 else f"{name}_retrieval"
-                extra=cfg.get("extra",{}).get(method,"")
-                print(sbatch(f"{method}_L{depth}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} --output_dir outputs/{run}"))
+                for method in cfg["methods"]:
+                    if depth==99 and method!="cfdm":
+                        # every sampler returns the leaf's image, so one retrieval run is enough
+                        continue
+                    run=f"{name}_{method}_L{depth}{suffix}" if depth!=99 else f"{name}_retrieval{suffix}"
+                    if finished(f"outputs/{run}"):
+                        continue
+                    extra=cfg.get("extra",{}).get(method,"")
+                    print(sbatch(f"{method}_L{depth}{suffix}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} --output_dir outputs/{run}"))
     if stage in ["sample","sample_nets","all"]:
         for kind,spec in nets.items():
             # the as-is checkpoint is unconditional, so only w=0 means anything; the cross-attention nets use w as the CFG scale
             ws="0" if kind=="pretrained" else "0 1 4"
             run=f"{name}_net_{kind}"
+            if finished(f"outputs/{run}"):
+                continue
             print(sbatch(f"net_{kind}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method net --model {spec} --steps 50 --w {ws} {metrics} --output_dir outputs/{run}"))
-    if stage in ["agreement","all"]:
+    if stage in ["agreement","all"] and not finished(f"outputs/agreement_{name}","agreement.json"):
         # target: the net trained from scratch on exactly our bank; the checkpoint and its fine-tune as "another DDPM"
         others=" ".join(v for k,v in nets.items() if k!="scratch")
         print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {others} --methods {' '.join(['ideal']+cfg['methods'])} {cfg.get('extra',{}).get('wiener','')} --n 64 --output_dir outputs/agreement_{name}"))

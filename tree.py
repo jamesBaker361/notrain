@@ -1,9 +1,9 @@
 '''
 hierarchical CLIP tree over a bank built by embed.py
 
-build: PCA on the CLIP image embeddings T, then recursive k-means in PCA space. A node with more than
---c_build images is split by k-means (k fixed, or chosen by silhouette score); a node with --c_build or
-fewer gets one leaf child per image, so every leaf holds exactly one image. Members of every node are
+build: PCA on the CLIP image embeddings T, then clustering in PCA space (--cluster_method): recursive k-means
+(k fixed, or chosen by silhouette score), recursive DBSCAN, or one agglomerative dendrogram (binary tree).
+A node with --c_build or fewer images gets one leaf child per image, so every leaf holds exactly one image. Members of every node are
 contiguous in tree["perm"], so node i owns bank rows perm[start[i]:end[i]].
 per node we store the mean CLIP embedding (full and PCA coords) and, for internal nodes, the mean and
 per-dim variance of the members' VAE latents (a leaf's stats are just its latent with variance 0).
@@ -34,6 +34,11 @@ parser.add_argument("--k_max",type=int,default=10,help="largest k tried with --b
 parser.add_argument("--silhouette_sample",type=int,default=2000,help="points used to estimate the silhouette score")
 parser.add_argument("--c_build",type=int,default=10,help="nodes with this many images or fewer get one leaf per image")
 parser.add_argument("--n_init",type=int,default=3,help="k-means restarts")
+parser.add_argument("--cluster_method",type=str,default="kmeans",choices=["kmeans","dbscan","agglomerative"],help="how nodes are split: recursive k-means, recursive DBSCAN, or one agglomerative dendrogram")
+parser.add_argument("--dbscan_min_samples",type=int,default=5,help="dbscan: min_samples, and the neighbor whose distance sets eps")
+parser.add_argument("--dbscan_quantile",type=float,default=0.5,help="dbscan: eps = this quantile of each node's min_samples-th-neighbor distances")
+parser.add_argument("--dbscan_noise",type=str,default="nearest",choices=["nearest","group"],help="dbscan: noise points join their nearest cluster, or form one extra child")
+parser.add_argument("--linkage",type=str,default="ward",choices=["ward","average","complete","single"],help="agglomerative: scipy linkage method")
 parser.add_argument("--seed",type=int,default=123)
 
 
@@ -60,48 +65,129 @@ def choose_k(Y:np.ndarray,branching:str,k_min:int,k_max:int,silhouette_sample:in
     return best_labels
 
 
+def dbscan_groups(Y:np.ndarray,min_samples:int,quantile:float,seed:int,noise:str="nearest"):
+    '''
+    split one node with DBSCAN. eps is set per node from the distribution of distances to each point's
+    min_samples-th neighbor (a fixed eps stops working as nodes get smaller and denser). Noise points (DBSCAN's
+    sparse border points) join the cluster of their nearest clustered point (noise="nearest"), or become one
+    extra group that is split further down (noise="group", which mixes border points of every cluster).
+    Returns relative index groups, or None if no eps gives 2+ groups
+    '''
+    from sklearn.cluster import DBSCAN
+    from sklearn.neighbors import NearestNeighbors
+    n=Y.shape[0]
+    k=max(1,min(min_samples,n-1))
+    knn=NearestNeighbors(n_neighbors=k+1).fit(Y).kneighbors(Y)[0][:,-1]
+    for q in [quantile,quantile/2,min(0.95,2*quantile),quantile/4]:
+        eps=float(np.quantile(knn,q))
+        if eps<=0:
+            continue
+        labels=DBSCAN(eps=eps,min_samples=k).fit_predict(Y)
+        if (labels>=0).sum()==0:
+            continue
+        if noise=="nearest" and (labels<0).any():
+            clustered=np.flatnonzero(labels>=0)
+            nearest=NearestNeighbors(n_neighbors=1).fit(Y[clustered]).kneighbors(Y[labels<0])[1][:,0]
+            labels[labels<0]=labels[clustered[nearest]]
+        groups=[np.flatnonzero(labels==l) for l in np.unique(labels) if l>=0]
+        if (labels<0).any():
+            groups.append(np.flatnonzero(labels<0))
+        if len(groups)>=2:
+            return groups
+    return None
+
+
 def build_tree(T:torch.Tensor,pca_dim:int=64,branching:str="10",k_min:int=2,k_max:int=10,silhouette_sample:int=2000,
-               c_build:int=10,n_init:int=3,seed:int=123)->dict:
+               c_build:int=10,n_init:int=3,seed:int=123,method:str="kmeans",dbscan_min_samples:int=5,
+               dbscan_quantile:float=0.5,linkage:str="ward",dbscan_noise:str="nearest")->dict:
     '''
     T: (N,E) normalized CLIP image embeddings. Returns the tree structure (no VAE stats; see add_node_stats)
+    method: "kmeans" (recursive k-means, k fixed or by silhouette), "dbscan" (recursive DBSCAN, falling back to
+    2-means when DBSCAN finds fewer than 2 groups), or "agglomerative" (one dendrogram over all images with
+    scipy linkage, used as the tree directly, so internal nodes are binary; O(N^2) memory, ~3GB for 28k images)
+    in every method, a node with <= c_build images gets one leaf child per image
     on macOS, sklearn and torch can load clashing OpenMP runtimes and segfault; run with OMP_NUM_THREADS=1
     '''
     # imported here so sample.py can use the sampling functions without sklearn
     from sklearn.decomposition import PCA
     T_np=T.float().cpu().numpy()
+    N=T_np.shape[0]
     pca=PCA(n_components=min(pca_dim,*T_np.shape),random_state=seed).fit(T_np)
     Y=pca.transform(T_np).astype(np.float32)
+    fallbacks=[0]
 
+    # each method describes its items (a node's image set) by: size, the image of a size-1 item, the size-1
+    # items of a small node, and how to split a large one
+    if method=="agglomerative":
+        from scipy.cluster.hierarchy import linkage as scipy_linkage
+        Z=scipy_linkage(Y.astype(np.float64),method=linkage)
+        root=2*N-2 if N>1 else 0
+        def size(c):
+            return 1 if c<N else int(Z[c-N,3])
+        def leaf_index(c):
+            return int(c)
+        def leaf_children(c):
+            out,stack=[],[c]
+            while stack:
+                x=stack.pop()
+                if x<N:
+                    out.append(int(x))
+                else:
+                    stack+=[int(Z[x-N,1]),int(Z[x-N,0])]
+            return out
+        def split(c):
+            return [int(Z[c-N,0]),int(Z[c-N,1])]
+    else:
+        root=np.arange(N)
+        def size(idx):
+            return len(idx)
+        def leaf_index(idx):
+            return int(idx[0])
+        def leaf_children(idx):
+            return [np.array([i]) for i in idx]
+        def split(idx):
+            groups=None
+            if method=="dbscan":
+                rel=dbscan_groups(Y[idx],dbscan_min_samples,dbscan_quantile,seed,dbscan_noise)
+                if rel is None:
+                    fallbacks[0]+=1
+                    labels=choose_k(Y[idx],"2",k_min,k_max,silhouette_sample,n_init,seed)
+                else:
+                    groups=[idx[g] for g in rel]
+            else:
+                labels=choose_k(Y[idx],branching,k_min,k_max,silhouette_sample,n_init,seed)
+            if groups is None:
+                groups=[idx[labels==l] for l in np.unique(labels)]
+            if len(groups)<2:
+                # identical embeddings: clustering can't split them, so cut into c_build-sized chunks
+                groups=np.array_split(idx,math.ceil(len(idx)/c_build))
+            return groups
+
+    # iterative pre-order DFS (dendrograms can be deeper than Python's recursion limit). A node is created when
+    # popped and its children are pushed in reverse, so its descendants come next and its images are the
+    # contiguous slice perm[start:start+size]
     parent,depth,start,end,children=[],[],[],[],[]
     perm=[]
-
-    def new_node(par:int,d:int)->int:
+    stack=[(root,-1,0)]
+    while stack:
+        item,par,d=stack.pop()
+        node=len(parent)
+        n=size(item)
         parent.append(par)
         depth.append(d)
         start.append(len(perm))
-        end.append(-1)
+        end.append(len(perm)+n)
         children.append([])
-        return len(parent)-1
-
-    def build(idx:np.ndarray,par:int,d:int)->int:
-        node=new_node(par,d)
-        if len(idx)==1:
-            perm.append(int(idx[0]))
-        elif len(idx)<=c_build:
-            for i in idx:
-                children[node].append(build(np.array([i]),node,d+1))
-        else:
-            labels=choose_k(Y[idx],branching,k_min,k_max,silhouette_sample,n_init,seed)
-            groups=[idx[labels==l] for l in np.unique(labels)]
-            if len(groups)<2:
-                # identical embeddings: k-means can't split them, so cut into c_build-sized chunks
-                groups=np.array_split(idx,math.ceil(len(idx)/c_build))
-            for g in groups:
-                children[node].append(build(g,node,d+1))
-        end[node]=len(perm)
-        return node
-
-    build(np.arange(T_np.shape[0]),-1,0)
+        if par>=0:
+            children[par].append(node)
+        if n==1:
+            perm.append(leaf_index(item))
+            continue
+        kids=leaf_children(item) if n<=c_build else split(item)
+        for kid in reversed(kids):
+            stack.append((kid,node,d+1))
+    if fallbacks[0]:
+        print(f"dbscan found fewer than 2 groups at {fallbacks[0]} nodes; split those with 2-means")
     return {
         "pca_components":torch.from_numpy(pca.components_.astype(np.float32)),
         "pca_mean":torch.from_numpy(pca.mean_.astype(np.float32)),
@@ -111,7 +197,8 @@ def build_tree(T:torch.Tensor,pca_dim:int=64,branching:str="10",k_min:int=2,k_ma
         "end":torch.tensor(end),
         "children":children,
         "perm":torch.tensor(perm),
-        "n":T_np.shape[0]
+        "n":N,
+        "cluster_method":method
     }
 
 
@@ -287,7 +374,8 @@ def main(args):
     X,T=bank["X"],bank["T"]
     print(f"bank {args.bank}: X {tuple(X.shape)} T {tuple(T.shape)}")
     start=time.time()
-    tree=build_tree(T,args.pca_dim,args.branching,args.k_min,args.k_max,args.silhouette_sample,args.c_build,args.n_init,args.seed)
+    tree=build_tree(T,args.pca_dim,args.branching,args.k_min,args.k_max,args.silhouette_sample,args.c_build,args.n_init,args.seed,
+                    args.cluster_method,args.dbscan_min_samples,args.dbscan_quantile,args.linkage,args.dbscan_noise)
     tree=add_node_stats(tree,X,T)
     tree["bank"]=args.bank
     tree["args"]=vars(args)

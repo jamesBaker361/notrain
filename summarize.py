@@ -31,9 +31,12 @@ def run_label(args:dict)->str:
         # finetune.py runs live in weights/<name>/ema
         return f"net {os.path.basename(os.path.dirname(model)) or model}"
     if args.get("method")=="tree":
+        # trees other than the default k-means one are named <bank>_tree_<method>.pt
+        tree_name=os.path.basename(args.get("tree") or "")
+        cluster=f" [{tree_name.split('_tree_')[1][:-3]}]" if "_tree_" in tree_name else ""
         if args["tree_depth"]>=99:
-            return "retrieval (leaf)"
-        return f"{args['node_sampler']} L{args['tree_depth']}"+(" (no tree)" if args["tree_depth"]==0 else "")
+            return "retrieval (leaf)"+cluster
+        return f"{args['node_sampler']} L{args['tree_depth']}"+(" (no tree)" if args["tree_depth"]==0 else "")+cluster
     return f"{args.get('method','cfdm')} scales{args.get('scales')}"
 
 
