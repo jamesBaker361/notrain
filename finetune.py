@@ -7,12 +7,16 @@ train a DiffusionNet (pretrained.py) on a bank: the checkpoint's own objective, 
                    closed-form samplers see exactly the same images)
 captions (bank["captions"], from embed.py --label_column or caption.py) are encoded to CLIP token states and
 dropped with prob --cfg_dropout (empty caption) for classifier-free guidance
+re-running is safe: a run whose checkpoint already reached --max_steps exits immediately, and a partial run
+(e.g. a preempted, requeued job) resumes from its last save, including optimizer and LR-schedule state;
+--overwrite starts over
 usage: sbatch runpygpu_chip.sh finetune.py --bank banks/cifar10_pix32.pt --base google/ddpm-cifar10-32 --init pretrained --cross_attention --name cifar10_ft
 '''
 import os
 import argparse
 import time
 import copy
+import json
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -41,12 +45,21 @@ parser.add_argument("--save_every",type=int,default=5000)
 parser.add_argument("--log_every",type=int,default=100)
 parser.add_argument("--gradient_checkpointing",action="store_true",help="trade compute for memory (256px models on a 10GB GPU)")
 parser.add_argument("--mixed_precision",type=str,default="bf16",choices=["no","fp16","bf16"])
+parser.add_argument("--overwrite",action="store_true",help="retrain from scratch even if a checkpoint exists")
 parser.add_argument("--project_name",type=str,default="notrain")
 parser.add_argument("--no_wandb",action="store_true")
 parser.add_argument("--seed",type=int,default=123)
 
 
 def main(args):
+    save_subdir=os.path.join(args.save_dir,args.name)
+    meta_path=os.path.join(save_subdir,"ema.json")
+    if not args.overwrite and os.path.exists(meta_path):
+        with open(meta_path) as f:
+            done=json.load(f).get("step",0)
+        if done>=args.max_steps:
+            print(f"{save_subdir} already trained to step {done} >= --max_steps {args.max_steps}; nothing to do (--overwrite to retrain)")
+            return
     accelerator=Accelerator(mixed_precision=args.mixed_precision,log_with=None if args.no_wandb else "wandb")
     device=accelerator.device
     torch.manual_seed(args.seed)
@@ -96,17 +109,27 @@ def main(args):
     ema=ema.to(device)
     alphas_cumprod=accelerator.unwrap_model(model).alphas_cumprod.to(device)
 
-    save_subdir=os.path.join(args.save_dir,args.name)
     os.makedirs(save_subdir,exist_ok=True)
     meta={"bank":args.bank,"n_train":n,"args":vars(args)}
+    state_path=os.path.join(save_subdir,"train_state.pt")
 
     def save(step:int):
         if accelerator.is_main_process:
             accelerator.unwrap_model(model).save(os.path.join(save_subdir,"model"),{**meta,"step":step})
             ema.save(os.path.join(save_subdir,"ema"),{**meta,"step":step})
+            torch.save({"optimizer":optimizer.state_dict(),"scheduler":scheduler.state_dict(),"step":step},state_path)
             print(f"saved step {step} to {save_subdir}")
 
     step=0
+    if not args.overwrite and os.path.exists(state_path):
+        # resume a partial run (e.g. preempted and requeued)
+        state=torch.load(state_path,map_location=device,weights_only=False)
+        accelerator.unwrap_model(model).load_state_dict(torch.load(os.path.join(save_subdir,"model.pt"),map_location=device,weights_only=True))
+        ema.load_state_dict(torch.load(os.path.join(save_subdir,"ema.pt"),map_location=device,weights_only=True))
+        optimizer.load_state_dict(state["optimizer"])
+        scheduler.load_state_dict(state["scheduler"])
+        step=state["step"]
+        print(f"resuming {save_subdir} from step {step}")
     start=time.time()
     loss_buffer=[]
     while step<args.max_steps:
@@ -144,7 +167,8 @@ def main(args):
                 save(step)
             if step>=args.max_steps:
                 break
-    save(step)
+    if step%args.save_every!=0:
+        save(step)
     accelerator.end_training()
 
 
