@@ -43,7 +43,15 @@ parser.add_argument("--bank_device",type=str,default="auto",choices=["auto","cpu
 parser.add_argument("--tree",type=str,default="",help="tree built by tree.py for this bank")
 parser.add_argument("--tree_depth",type=int,default=5,help="stop the descent at this depth (L)")
 parser.add_argument("--c_search",type=int,default=20,help="stop the descent at the first node with this many images or fewer")
-parser.add_argument("--node_sampler",type=str,default="lowrank",choices=["diagonal","lowrank","cfdm","locality","wiener","ls"],help="how to sample from the stopping node; cfdm uses --sigma, --M, --steps, --start_t; locality/wiener (Lukoianov et al.) use --steps, --tau, --wiener_shrinkage, --wiener_ridge; ls (Kamb & Ganguli) uses --steps, --ls_patch_fracs")
+parser.add_argument("--node_sampler",type=str,default="lowrank",choices=["diagonal","lowrank","cfdm","locality","wiener","ls","curve"],help="how to sample from the stopping node; cfdm uses --sigma, --M, --steps, --start_t; locality/wiener (Lukoianov et al.) use --steps, --tau, --wiener_shrinkage, --wiener_ridge; ls (Kamb & Ganguli) uses --steps, --ls_patch_fracs; curve (a spline through the node's images in TSP order) uses --curve_*, --tsp, --tsp_kicks, --steps")
+parser.add_argument("--curve_mode",type=str,default="random",choices=["random","flow"],help="curve: pick a random point on the curve (text-weighted), or run the ideal-denoiser flow toward the curve")
+parser.add_argument("--curve_max_points",type=int,default=2000,help="curve: nodes with more images fit the curve through a random subset of this many")
+parser.add_argument("--curve_knots",type=int,default=0,help="curve: B-spline basis functions; 0 = one per image (the curve passes through every image), fewer = smoother curves that average neighboring images")
+parser.add_argument("--curve_degree",type=int,default=1,help="curve: spline degree; 1 = polyline through the images (crossfades between path neighbors), 3 = cubic (smoother, but overshoots between dissimilar images)")
+parser.add_argument("--curve_smooth",type=float,default=0.0,help="curve: second-difference penalty relative to the fit term (0 = least squares)")
+parser.add_argument("--curve_grid",type=int,default=0,help="curve: points along the curve that samples are drawn from; 0 = 16 per image within a 2GB budget")
+parser.add_argument("--tsp",type=str,default="auto",choices=["auto","2opt","lkh"],help="curve: image order by chained 2-opt, or LKH (pip install elkai); auto uses LKH if installed")
+parser.add_argument("--tsp_kicks",type=int,default=30,help="curve: double-bridge kicks for chained 2-opt")
 parser.add_argument("--ls_patch_fracs",type=float,nargs="+",default=None,help="ls: patch sizes from noise to data as fractions of the image side; default is the CelebA-64 schedule from Lukoianov et al.")
 parser.add_argument("--tau",type=float,default=0.02,help="locality: Wiener-matrix binarization threshold, relative to each row's max")
 parser.add_argument("--wiener_shrinkage",type=float,default=0.0,help="locality/wiener: blend the node covariance toward the full-bank covariance (0 = node only, 1 = global)")
@@ -167,7 +175,10 @@ def main(args):
                                                    "S_global":S_global,"spectrum":spectrum,"cache":eig_cache,
                                                    "shape":bank["shape"],"ls_patch_fracs":args.ls_patch_fracs,
                                                    "wiener_rank":args.wiener_rank,"global_lowrank":global_lowrank,
-                                                   "log_prior":log_priors[p] if args.node_text_prior else None,"w":w},
+                                                   "log_prior":log_priors[p] if args.node_text_prior else None,"w":w,
+                                                   "curve":{"max_points":args.curve_max_points,"n_knots":args.curve_knots,"degree":args.curve_degree,"smooth":args.curve_smooth,
+                                                            "grid":args.curve_grid,"mode":args.curve_mode,"tsp":args.tsp,"kicks":args.tsp_kicks,
+                                                            "steps":args.steps,"log_prior":log_priors[p],"w":w}},
                                   device=device)
             return out,nodes,None
         X_sub,log_prior,idx=top_k_subset(X,log_priors[p],args.top_k)

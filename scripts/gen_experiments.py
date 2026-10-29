@@ -137,6 +137,9 @@ for data,flags,caption,steps in [
             "nets":["scratch"],
             **net_flags,
         }
+# every setting also runs the curve sampler (a polyline through the node's images in TSP order, sampled along)
+for cfg in SETTINGS.values():
+    cfg["methods"]=cfg["methods"]+["curve"]
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","tree","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
@@ -163,6 +166,7 @@ method_flags={
     "locality":"--node_sampler locality --steps 10 --tau 0.02 --wiener_shrinkage 0.5 --wiener_ridge 0",
     "wiener":"--node_sampler wiener --steps 10 --wiener_shrinkage 0.5 --wiener_ridge 0",
     "ls":"--node_sampler ls --steps 10",
+    "curve":"--node_sampler curve --curve_mode random",
 }
 # fine-tuning starts from the checkpoint (lower lr); scratch training from random init
 train_flags={"ft":"--init pretrained --cross_attention --lr 2e-5","scratch":"--init scratch --cross_attention --lr 1e-4"}
@@ -235,6 +239,6 @@ for name in settings:
     if stage in ["agreement","all"] and not finished(f"outputs/agreement_{name}","agreement.json"):
         # target: the net trained from scratch on exactly our bank; the checkpoint and its fine-tune as "another DDPM"
         others=" ".join(v for k,v in nets.items() if k!="scratch")
-        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {others} --methods {' '.join(['ideal']+cfg['methods'])} {cfg.get('extra',{}).get('wiener','')} --n 64 --output_dir outputs/agreement_{name}"))
+        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {others} --methods {' '.join(['ideal']+[m for m in cfg['methods'] if m!='curve'])} {cfg.get('extra',{}).get('wiener','')} --n 64 --output_dir outputs/agreement_{name}"))
     if stage in ["summarize","all"]:
         print(f"python summarize.py --runs 'outputs/{name}_*' --output_dir outputs/summary_{name}")

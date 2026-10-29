@@ -281,6 +281,8 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
     locality.py's masked analytical model ("locality") / linear Wiener filter ("wiener") with node statistics
     cfdm_kwargs: passed to cfdm.sample, e.g. log_prior (over all bank rows), w, sigma, M, steps, start_t
     ls: Kamb & Ganguli's local score machine (els.py) with a patch-size schedule (locality_kwargs shape, ls_patch_fracs)
+    curve: a P-spline curve through the node's images in TSP order, sampled along (curve.py; locality_kwargs["curve"]:
+    max_points, n_knots, degree, smooth, grid, mode, tsp, kicks, log_prior, w; the fitted curve is cached per node)
     locality_kwargs: tau, steps, shrinkage, S_global, ridge, log_prior (over all bank rows), w, and cache, a dict
     reused across calls so each node's eigendecomposition is computed once
     device: where to sample (default X's device); X may stay on the CPU (e.g. a float16 256px pixel bank),
@@ -298,6 +300,25 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
             cache[key]=LowRankWiener(low_rank_cov(X[members.to(X.device)],kwargs["wiener_rank"],device),
                                      kwargs.get("global_lowrank"),kwargs.get("shrinkage",0.0),kwargs.get("ridge",0.0))
         return wiener_lowrank_sample(n,cache[key],kwargs.get("steps",10),generator=generator)
+    if node_sampler=="curve" and len(members)>1:
+        from curve import Curve,curve_sample
+        kwargs=dict((locality_kwargs or {}).get("curve") or {})
+        cache=(locality_kwargs or {}).get("cache",{})
+        max_points=kwargs.get("max_points",2000)
+        key=("curve",node,max_points,kwargs.get("n_knots",0),kwargs.get("degree",1),kwargs.get("smooth",0.0),kwargs.get("grid",0),kwargs.get("tsp","auto"))
+        if key not in cache:
+            # big nodes (e.g. depth 0): the curve goes through a fixed random subset of max_points images
+            sub=members
+            if len(members)>max_points:
+                sub=members[torch.randperm(len(members),generator=torch.Generator().manual_seed(node))[:max_points]]
+            built=Curve(X[sub.to(X.device)].to(device).float(),kwargs.get("n_knots",0),kwargs.get("smooth",0.0),
+                        kwargs.get("grid",0),kwargs.get("tsp","auto"),kwargs.get("kicks",30),seed=node,degree=kwargs.get("degree",1))
+            cache[key]=(built,sub)
+        built,sub=cache[key]
+        log_prior=kwargs.get("log_prior")
+        if log_prior is not None:
+            log_prior=torch.log_softmax(log_prior[sub.to(log_prior.device)].to(device).float(),dim=-1)
+        return curve_sample(n,built,log_prior,kwargs.get("w",0.0),kwargs.get("mode","random"),kwargs.get("steps",10),generator)
     Xn=X[members.to(X.device)].to(device).float()
     members=members.to(device)
     def randn(*shape):
@@ -330,7 +351,7 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         shrinkage=kwargs.pop("shrinkage",0.0)
         ridge=kwargs.pop("ridge",0.0)
         S_global=kwargs.pop("S_global",None)
-        for k in ["spectrum","shape","ls_patch_fracs","wiener_rank","global_lowrank"]:
+        for k in ["spectrum","shape","ls_patch_fracs","wiener_rank","global_lowrank","curve"]:
             kwargs.pop(k,None)
         log_prior=kwargs.pop("log_prior",None)
         if log_prior is not None:
