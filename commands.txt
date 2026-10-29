@@ -48,11 +48,13 @@ python scripts/gen_experiments.py summarize | bash
 Notes
 ==========================================================================================
 - One setting only: add its name, e.g.  python scripts/gen_experiments.py build cifar10_pix32 | bash
-  (settings: cifar10_pix32, celebahq_pix256, celebahq_ldm, celebahq_pix64, imagenet_pix64, wikiart_pix64, league_pix64)
-- Just the ImageNet / WikiArt / League settings (64x64 pixels, BLIP + metadata captions, scratch nets only):
-  python scripts/gen_experiments.py build imagenet_pix64 wikiart_pix64 league_pix64 | bash
-  python scripts/gen_experiments.py train imagenet_pix64 wikiart_pix64 league_pix64 | bash   (after their caption_* jobs finish: training needs the captions)
-  python scripts/gen_experiments.py sample_tree imagenet_pix64 wikiart_pix64 league_pix64 | bash   (after their tree_* jobs finish)
+  (settings: cifar10_pix32, celebahq_pix256, celebahq_ldm, celebahq_pix64, and for each of imagenet, wikiart, league:
+   <data>_pix64, <data>_pix256, <data>_ldm)
+- Just the ImageNet / WikiArt / League settings (BLIP + metadata captions, scratch nets only):
+  NEW="imagenet_pix64 wikiart_pix64 league_pix64 imagenet_pix256 wikiart_pix256 league_pix256 imagenet_ldm wikiart_ldm league_ldm"
+  python scripts/gen_experiments.py build $NEW | bash
+  python scripts/gen_experiments.py train $NEW | bash         (after their caption_* jobs finish: training needs the captions)
+  python scripts/gen_experiments.py sample_tree $NEW | bash   (after their tree_* jobs finish)
 - Re-running a stage is safe: sample/agreement runs whose results already exist (outputs/<run>/metrics.json,
   outputs/agreement_<setting>/agreement.json) aren't printed, and finetune.py exits if the model is already trained.
   Runs still in progress have no results yet, so wait for them to finish before re-running a stage.

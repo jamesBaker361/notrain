@@ -11,6 +11,10 @@
 #   league_pix64     jlbaker361/league-splash-tagged, 2000 splash arts (200 held out), captions = BLIP + skin and champion
 #   these three have no pretrained checkpoint, so their nets are the celebahq-256 architecture at 64x64 with
 #   cross-attention, trained from scratch
+#   {imagenet,wikiart,league}_pix256 and _ldm: the same data at 256x256 pixels and in the VQ latents of
+#   CompVis/ldm-celebahq-256, set up like celebahq_pix256 / celebahq_ldm with scratch nets only. ImageNet at 256
+#   comes from benjamin-paine/imagenet-1k-256x256's validation split (0.7GB, not class-sorted; 30k bank + 2k held
+#   out) rather than its 20GB train split. The VQ autoencoder was trained on faces: check its reconstructions here
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
 # usage: python scripts/gen_experiments.py build|tree|train|sample_tree|sample_nets|agreement|summarize [setting ...]
@@ -22,6 +26,10 @@ import os
 import sys
 stage=sys.argv[1] if len(sys.argv)>1 else "all"
 
+WIKIART_DATA="--dataset huggan/wikiart --data_files 'data/train-0000*.parquet' 'data/train-0001*.parquet' --holdout 1000 --metadata_columns artist genre style"
+WIKIART_CAPTION="--caption_template '{blip}, {style} {genre} by {artist}'"
+LEAGUE_DATA="--dataset jlbaker361/league-splash-tagged --shuffle --holdout 200 --metadata_columns champion tag"
+LEAGUE_CAPTION="--caption_template '{blip}, {tag} {champion} splash art'"
 SETTINGS={
     "cifar10_pix32":{
         "embed":"--dataset uoft-cs/cifar10 --image_column img --test_split test --label_column label --space pixel --resolution 32",
@@ -81,9 +89,9 @@ SETTINGS={
     },
     "wikiart_pix64":{
         # 20 shards ~ 9GB of the 34GB dataset; only a train split, so the last 1000 are held out
-        "embed":"--dataset huggan/wikiart --data_files 'data/train-0000*.parquet' 'data/train-0001*.parquet' --holdout 1000 --metadata_columns artist genre style --space pixel --resolution 64",
+        "embed":f"{WIKIART_DATA} --space pixel --resolution 64",
         "blip":True,
-        "caption":"--caption_template '{blip}, {style} {genre} by {artist}'",
+        "caption":WIKIART_CAPTION,
         "base":"google/ddpm-celebahq-256",
         "sample_size":64,
         "prompts":"prompts/wikiart.txt",
@@ -94,9 +102,9 @@ SETTINGS={
     },
     "league_pix64":{
         # sorted by champion, hence --shuffle before the holdout; 1215x717 splashes are center-cropped to squares
-        "embed":"--dataset jlbaker361/league-splash-tagged --shuffle --holdout 200 --metadata_columns champion tag --space pixel --resolution 64",
+        "embed":f"{LEAGUE_DATA} --space pixel --resolution 64",
         "blip":True,
-        "caption":"--caption_template '{blip}, {tag} {champion} splash art'",
+        "caption":LEAGUE_CAPTION,
         "base":"google/ddpm-celebahq-256",
         "sample_size":64,
         "prompts":"prompts/league-splash-tagged.txt",
@@ -107,6 +115,26 @@ SETTINGS={
         "nets":["scratch"],
     },
 }
+# the same three datasets at 256x256 pixels and in the LDM's VQ latents, configured like the CelebA-HQ settings
+for data,flags,caption,steps in [
+    ("imagenet","--dataset benjamin-paine/imagenet-1k-256x256 --data_files 'data/validation-*.parquet' --limit 32000 --holdout 2000","",50000),
+    ("wikiart",WIKIART_DATA,WIKIART_CAPTION,50000),
+    # only 1800 training images
+    ("league",LEAGUE_DATA,LEAGUE_CAPTION,20000),
+]:
+    for space,template,embed_flags in [
+        ("pix256","celebahq_pix256","--space pixel --resolution 256 --store_dtype float16 --batch_size 16"),
+        ("ldm","celebahq_ldm","--space vq --vae CompVis/ldm-celebahq-256 --resolution 256"),
+    ]:
+        base=SETTINGS[template]
+        SETTINGS[f"{data}_{space}"]={
+            **base,
+            "embed":f"{flags} {embed_flags}",
+            "caption":caption,
+            "prompts":f"prompts/{'league-splash-tagged' if data=='league' else data}.txt",
+            "train":base["train"].replace("--max_steps 50000",f"--max_steps {steps}"),
+            "nets":["scratch"],
+        }
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","tree","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
