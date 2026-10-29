@@ -15,9 +15,8 @@ import argparse
 import time
 import torch
 import torchvision.transforms as transforms
-from datasets import load_dataset
 from experiment_helpers.gpu_details import print_details
-from bank import load_clip,encode_images_clip,encode_texts_clip,load_vae,encode_vae
+from bank import load_images,metadata_strings,load_clip,encode_images_clip,encode_texts_clip,load_vae,encode_vae
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--dataset",type=str,default="korexyz/celeba-hq-256x256")
@@ -26,6 +25,10 @@ parser.add_argument("--test_split",type=str,default="",help="held-out split stor
 parser.add_argument("--image_column",type=str,default="image")
 parser.add_argument("--label_column",type=str,default="",help="class-label column; with it, captions come from --caption_template and the class names")
 parser.add_argument("--caption_template",type=str,default="a photo of a {}")
+parser.add_argument("--data_files",type=str,nargs="*",default=None,help="only these shards (globs, relative to the dataset repo), e.g. data/train-0000*.parquet for part of huggan/wikiart")
+parser.add_argument("--shuffle",action="store_true",help="shuffle each split (with --seed) before --limit/--test_limit; for class-sorted datasets like ImageNet")
+parser.add_argument("--seed",type=int,default=123)
+parser.add_argument("--metadata_columns",type=str,nargs="*",default=[],help="columns kept as strings in bank['metadata'] for caption.py --caption_template, e.g. artist genre style")
 parser.add_argument("--limit",type=int,default=-1)
 parser.add_argument("--test_limit",type=int,default=-1)
 parser.add_argument("--resolution",type=int,default=256)
@@ -52,10 +55,7 @@ def main(args):
     vae_name=args.vae or {"vae":"stabilityai/sd-vae-ft-mse","vq":"CompVis/ldm-celebahq-256"}.get(args.space)
 
     def load(split:str,limit:int):
-        ds=load_dataset(args.dataset,split=split)
-        if limit>0:
-            ds=ds.select(range(min(limit,len(ds))))
-        return ds
+        return load_images(args.dataset,split,limit,args.data_files,args.shuffle,args.seed)
 
     dataset=load(args.split,args.limit)
     test_dataset=load(args.test_split,args.test_limit) if args.test_split else None
@@ -104,6 +104,8 @@ def main(args):
         return emb[[index[c] for c in captions]]
 
     X,T,shape=embed(dataset)
+    metadata={c:metadata_strings(dataset,c) for c in args.metadata_columns}
+    metadata_test={c:metadata_strings(test_dataset,c) for c in args.metadata_columns} if test_dataset is not None else None
     captions=label_captions(dataset) if args.label_column else None
     if test_dataset is not None:
         X_test,T_test,_=embed(test_dataset)
@@ -112,6 +114,8 @@ def main(args):
         n_train=X.shape[0]-args.holdout
         assert n_train>0,"--holdout must leave some training images"
         X,X_test,T,T_test=X[:n_train],X[n_train:],T[:n_train],T[n_train:]
+        metadata_test={c:v[n_train:] for c,v in metadata.items()}
+        metadata={c:v[:n_train] for c,v in metadata.items()}
         if captions is not None:
             captions,captions_test=captions[:n_train],captions[n_train:]
         else:
@@ -128,6 +132,9 @@ def main(args):
         "logit_scale":clip_model.logit_scale.exp().item(),
         "args":vars(args)
     }
+    if metadata:
+        bank["metadata"]=metadata
+        bank["metadata_test"]=metadata_test
     if captions is not None:
         bank["captions"]=captions
         bank["C"]=caption_embeds(captions)

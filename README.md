@@ -98,7 +98,17 @@ Per-prompt metrics also include `diversity` (pixel distance), `lpips_diversity` 
 
 ## Standard datasets and trained baselines
 
-The experiments use standard Hugging Face datasets with their official held-out splits: `uoft-cs/cifar10` (50k train / 10k test) and `korexyz/celeba-hq-256x256` (28k train / 2k validation). `embed.py --test_split` stores the held-out split as `X_test` (the FID reference). `--label_column label --caption_template "a photo of a {}"` makes captions from class names; CelebA-HQ gets BLIP captions from `caption.py`. `--space vq` encodes images with the VQ autoencoder of `CompVis/ldm-celebahq-256`, so the closed-form samplers work in the same 3×64×64 latent space as that LDM.
+The experiments use standard Hugging Face datasets with their official held-out splits: `uoft-cs/cifar10` (50k train / 10k test) and `korexyz/celeba-hq-256x256` (28k train / 2k validation). `embed.py --test_split` stores the held-out split as `X_test` (the FID reference). `--label_column label --caption_template "a photo of a {}"` makes captions from class names; CelebA-HQ gets BLIP captions from `caption.py`.
+
+Three more 64×64 pixel settings add more varied captions:
+
+- `imagenet_pix64`: 30k shuffled images of `benjamin-paine/imagenet-1k-64x64`, with 2k from its validation split held out. `--shuffle` is needed because the dataset is sorted by class.
+- `wikiart_pix64`: the first 20 of `huggan/wikiart`'s 72 shards (already shuffled), about 22k paintings and 9GB, with 1k held out. `--data_files` loads only those shards.
+- `league_pix64`: the 2,000 splash arts of `jlbaker361/league-splash-tagged`, with 200 held out.
+
+`embed.py --metadata_columns` keeps dataset columns (class labels converted to readable names) in `bank["metadata"]`. `caption.py --caption_template` combines them with the BLIP caption, e.g. `"{blip}, {style} {genre} by {artist}"` for WikiArt and `"{blip}, {tag} {champion} splash art"` for League. A template without `{blip}` skips BLIP. These settings have no pretrained checkpoint, so their only net is the `google/ddpm-celebahq-256` architecture at 64×64 with cross-attention, trained from scratch. League's 200 held-out images make its FID noisy.
+
+`--space vq` encodes images with the VQ autoencoder of `CompVis/ldm-celebahq-256`, so the closed-form samplers work in the same 3×64×64 latent space as that LDM.
 
 `pretrained.py` wraps `google/ddpm-cifar10-32`, `google/ddpm-celebahq-256` and `CompVis/ldm-celebahq-256` (noise-predicting `UNet2DModel`s) in this repo's convention z = t·x + (1−t)·ε. The noisy state x_k = z/√(t²+(1−t)²) has √ᾱ = t/√(t²+(1−t)²), the timestep is interpolated from the checkpoint's schedule, and x̂₀ = (x_k − √(1−ᾱ)·ε̂)/√ᾱ. That way the networks and the closed-form samplers share the time grid and the starting noise. Sampling starts at the checkpoint's noisiest training point (`t_min`: 0.006 for the DDPMs, 0.068 for the LDM).
 

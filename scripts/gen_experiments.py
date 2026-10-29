@@ -5,6 +5,12 @@
 #   celebahq_pix64   same faces as pixels at 64x64 (the locality paper's setting); no 64px checkpoint exists, so the
 #                    nets are the celebahq-256 architecture run at 64x64 with cross-attention (from scratch, and
 #                    fine-tuned from the 256px weights)
+#   imagenet_pix64   30k shuffled images of benjamin-paine/imagenet-1k-64x64 (2k of validation held out), BLIP captions
+#   wikiart_pix64    the first 20 of huggan/wikiart's 72 (already shuffled) shards, ~22k paintings (1k held out),
+#                    captions = BLIP + style, genre and artist
+#   league_pix64     jlbaker361/league-splash-tagged, 2000 splash arts (200 held out), captions = BLIP + skin and champion
+#   these three have no pretrained checkpoint, so their nets are the celebahq-256 architecture at 64x64 with
+#   cross-attention, trained from scratch
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
 # usage: python scripts/gen_experiments.py build|tree|train|sample_tree|sample_nets|agreement|summarize [setting ...]
@@ -61,6 +67,45 @@ SETTINGS={
         # the 256px checkpoint as-is doesn't apply to 64px inputs
         "nets":["ft","scratch"],
     },
+    "imagenet_pix64":{
+        # sorted by class, hence --shuffle; captions are BLIP's (the class names are kept as metadata "label")
+        "embed":"--dataset benjamin-paine/imagenet-1k-64x64 --test_split validation --shuffle --limit 30000 --test_limit 2000 --metadata_columns label --space pixel --resolution 64",
+        "blip":True,
+        "base":"google/ddpm-celebahq-256",
+        "sample_size":64,
+        "prompts":"prompts/imagenet.txt",
+        "train":"--batch_size 64 --max_steps 100000",
+        "methods":["cfdm","locality","wiener","ls"],
+        "depths":[0,2,4,8,99],
+        "nets":["scratch"],
+    },
+    "wikiart_pix64":{
+        # 20 shards ~ 9GB of the 34GB dataset; only a train split, so the last 1000 are held out
+        "embed":"--dataset huggan/wikiart --data_files 'data/train-0000*.parquet' 'data/train-0001*.parquet' --holdout 1000 --metadata_columns artist genre style --space pixel --resolution 64",
+        "blip":True,
+        "caption":"--caption_template '{blip}, {style} {genre} by {artist}'",
+        "base":"google/ddpm-celebahq-256",
+        "sample_size":64,
+        "prompts":"prompts/wikiart.txt",
+        "train":"--batch_size 64 --max_steps 100000",
+        "methods":["cfdm","locality","wiener","ls"],
+        "depths":[0,2,4,8,99],
+        "nets":["scratch"],
+    },
+    "league_pix64":{
+        # sorted by champion, hence --shuffle before the holdout; 1215x717 splashes are center-cropped to squares
+        "embed":"--dataset jlbaker361/league-splash-tagged --shuffle --holdout 200 --metadata_columns champion tag --space pixel --resolution 64",
+        "blip":True,
+        "caption":"--caption_template '{blip}, {tag} {champion} splash art'",
+        "base":"google/ddpm-celebahq-256",
+        "sample_size":64,
+        "prompts":"prompts/league-splash-tagged.txt",
+        # only 1800 training images
+        "train":"--batch_size 64 --max_steps 20000",
+        "methods":["cfdm","locality","wiener","ls"],
+        "depths":[0,2,4,8,99],
+        "nets":["scratch"],
+    },
 }
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","tree","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
@@ -116,7 +161,8 @@ for name in settings:
         embed_args=cfg["embed"]
         line=f"jid=$({sbatch('embed_'+name,'embed/'+name,f'embed.py {embed_args} --save_path {bank}')})"
         if cfg["blip"]:
-            line+=f" && jid=$({sbatch('caption_'+name,'caption/'+name,f'caption.py --bank {bank}','$jid')})"
+            caption_cmd=f"caption.py --bank {bank} {cfg.get('caption','')}"
+            line+=f" && jid=$({sbatch('caption_'+name,'caption/'+name,caption_cmd,'$jid')})"
         for job,log,cmd in tree_jobs:
             line+=f" && {sbatch(job,log,cmd,'$jid')}"
         print(line)
@@ -126,6 +172,8 @@ for name in settings:
             print(sbatch(job,log,cmd))
     if stage in ["train","all"]:
         for kind,flags in train_flags.items():
+            if kind not in nets:
+                continue
             print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {size} {cfg['train']}",
                          script=cfg.get("train_script","runpygpu_chip.sh")))
     if stage in ["sample","sample_tree","all"]:
