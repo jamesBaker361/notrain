@@ -11,10 +11,11 @@
 #   league_pix64     jlbaker361/league-splash-tagged, 2000 splash arts (200 held out), captions = BLIP + skin and champion
 #   these three have no pretrained checkpoint, so their nets are the celebahq-256 architecture at 64x64 with
 #   cross-attention, trained from scratch
-#   {imagenet,wikiart,league}_pix256 and _ldm: the same data at 256x256 pixels and in the VQ latents of
-#   CompVis/ldm-celebahq-256, set up like celebahq_pix256 / celebahq_ldm with scratch nets only. ImageNet at 256
-#   comes from benjamin-paine/imagenet-1k-256x256's validation split (0.7GB, not class-sorted; 30k bank + 2k held
-#   out) rather than its 20GB train split. The VQ autoencoder was trained on faces: check its reconstructions here
+#   {imagenet,wikiart,league}_pix256 and _ldm: the same data at 256x256 pixels, and in the 4x32x32 latents of the
+#   Stable Diffusion VAE (stabilityai/sd-vae-ft-mse; the CelebA-HQ LDM's VQ autoencoder was trained only on faces),
+#   set up like celebahq_pix256 / celebahq_ldm with scratch nets only (the ldm-celebahq-256 UNet with 4 channels at
+#   32x32). ImageNet at 256 comes from benjamin-paine/imagenet-1k-256x256's validation split (0.7GB, not
+#   class-sorted; 30k bank + 2k held out) rather than its 20GB train split
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
 # usage: python scripts/gen_experiments.py build|tree|train|sample_tree|sample_nets|agreement|summarize [setting ...]
@@ -122,9 +123,9 @@ for data,flags,caption,steps in [
     # only 1800 training images
     ("league",LEAGUE_DATA,LEAGUE_CAPTION,20000),
 ]:
-    for space,template,embed_flags in [
-        ("pix256","celebahq_pix256","--space pixel --resolution 256 --store_dtype float16 --batch_size 16"),
-        ("ldm","celebahq_ldm","--space vq --vae CompVis/ldm-celebahq-256 --resolution 256"),
+    for space,template,embed_flags,net_flags in [
+        ("pix256","celebahq_pix256","--space pixel --resolution 256 --store_dtype float16 --batch_size 16",{}),
+        ("ldm","celebahq_ldm","--space vae --vae stabilityai/sd-vae-ft-mse --resolution 256",{"sample_size":32,"channels":4}),
     ]:
         base=SETTINGS[template]
         SETTINGS[f"{data}_{space}"]={
@@ -134,6 +135,7 @@ for data,flags,caption,steps in [
             "prompts":f"prompts/{'league-splash-tagged' if data=='league' else data}.txt",
             "train":base["train"].replace("--max_steps 50000",f"--max_steps {steps}"),
             "nets":["scratch"],
+            **net_flags,
         }
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","tree","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
@@ -184,6 +186,8 @@ for name in settings:
     nets={"pretrained":f"pretrained:{cfg['base']}","ft":f"weights/{name}_ft/ema","scratch":f"weights/{name}_scratch/ema"}
     nets={k:v for k,v in nets.items() if k in cfg.get("nets",nets)}
     size=f"--sample_size {cfg['sample_size']}" if cfg.get("sample_size") else ""
+    if cfg.get("channels"):
+        size+=f" --channels {cfg['channels']}"
     if stage in ["build","all"]:
         # embed -> (BLIP captions) -> tree, each waiting for the previous job
         embed_args=cfg["embed"]

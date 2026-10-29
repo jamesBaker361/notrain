@@ -98,3 +98,17 @@ def test_celebahq_architecture_at_64(tmp_path):
 def test_sample_size_must_divide():
     with pytest.raises(AssertionError):
         DiffusionNet("google/ddpm-celebahq-256","scratch",sample_size=48)
+
+
+def test_scratch_channels_override(tmp_path):
+    # the LDM UNet on 4x32x32 SD-VAE latents instead of its 3x64x64 VQ latents
+    net=DiffusionNet("CompVis/ldm-celebahq-256","scratch",cross_attention=True,token_dim=16,sample_size=32,channels=4).eval()
+    assert net.unet.config.in_channels==4 and net.unet.config.out_channels==4
+    with torch.no_grad():
+        out=net.x0(torch.randn(1,4,32,32),0.5,torch.randn(1,5,16),torch.ones(1,5),torch.zeros(1,5,16),torch.ones(1,5),w=2.0)
+    assert out.shape==(1,4,32,32) and torch.isfinite(out).all()
+    net.save(str(tmp_path/"m"))
+    loaded,meta=DiffusionNet.load(str(tmp_path/"m"))
+    assert meta["diffusion_net"]["channels"]==4 and loaded.unet.config.in_channels==4
+    with pytest.raises(AssertionError):
+        DiffusionNet("CompVis/ldm-celebahq-256","pretrained",channels=4)

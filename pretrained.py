@@ -21,6 +21,8 @@ w=0 unconditional, w=1 conditional.
 init="scratch" keeps the architecture but re-initializes the weights (trained on our bank by finetune.py).
 sample_size overrides the input resolution: the UNets are fully convolutional, so e.g. the celebahq-256
 architecture runs on 64x64 faces (its bottom level becomes 2x2); pretrained weights then start from the 256px ones.
+channels (scratch only) overrides the input/output channels, e.g. the ldm-celebahq-256 UNet on the 4x32x32 latents
+of the Stable Diffusion VAE instead of its own 3x64x64 VQ latents.
 '''
 import json
 import math
@@ -62,13 +64,16 @@ class CrossAttnAdapter(nn.Module):
 
 
 class DiffusionNet(nn.Module):
-    def __init__(self,base:str,init:str="pretrained",cross_attention:bool=False,token_dim:int=768,sample_size:int=None):
+    def __init__(self,base:str,init:str="pretrained",cross_attention:bool=False,token_dim:int=768,sample_size:int=None,
+                 channels:int=None):
         super().__init__()
         assert base in BASES,f"unknown base {base}, expected one of {list(BASES)}"
         spec=BASES[base]
-        self.config={"base":base,"init":init,"cross_attention":cross_attention,"token_dim":token_dim,"sample_size":sample_size}
+        self.config={"base":base,"init":init,"cross_attention":cross_attention,"token_dim":token_dim,"sample_size":sample_size,
+                     "channels":channels}
         kwargs={"subfolder":spec["unet_subfolder"]} if spec["unet_subfolder"] else {}
         if init=="pretrained":
+            assert not channels,"channels can only change when training from scratch"
             self.unet=UNet2DModel.from_pretrained(base,**kwargs)
             if sample_size:
                 self.unet.register_to_config(sample_size=sample_size)
@@ -78,6 +83,8 @@ class DiffusionNet(nn.Module):
                 config["sample_size"]=sample_size
                 n_down=len(config["block_out_channels"])-1
                 assert sample_size%(2**n_down)==0,f"{base} downsamples {n_down} times; {sample_size} is not divisible by {2**n_down}"
+            if channels:
+                config["in_channels"]=config["out_channels"]=channels
             self.unet=UNet2DModel.from_config(config)
         skw={"subfolder":spec["scheduler_subfolder"]} if spec["scheduler_subfolder"] else {}
         # the training noise schedule (DDPM betas) of the checkpoint, whatever sampler it shipped with
