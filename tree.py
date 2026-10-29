@@ -40,6 +40,8 @@ parser.add_argument("--dbscan_quantile",type=float,default=0.5,help="dbscan: eps
 parser.add_argument("--dbscan_noise",type=str,default="nearest",choices=["nearest","group"],help="dbscan: noise points join their nearest cluster, or form one extra child")
 parser.add_argument("--vae_stats",type=str,default="auto",choices=["auto","yes","no"],help="store per-node mean/variance of the bank vectors (diagonal sampler only); auto skips them when over 4GB")
 parser.add_argument("--linkage",type=str,default="ward",choices=["ward","average","complete","single"],help="agglomerative: scipy linkage method")
+parser.add_argument("--cluster_on",type=str,default="image",choices=["image","caption","mix"],help="embeddings the tree is built from (and the descent compares the prompt to): CLIP image embeddings T, CLIP text embeddings of the captions C, or a normalized blend")
+parser.add_argument("--caption_weight",type=float,default=0.5,help="mix: weight a of the captions in normalize((1-a) T + a C)")
 parser.add_argument("--seed",type=int,default=123)
 
 
@@ -404,15 +406,38 @@ def tree_sample(tree:dict,X:torch.Tensor,text_embed:torch.Tensor,n:int,w:float,l
     return out,nodes
 
 
+def cluster_embeddings(bank:dict,cluster_on:str="image",caption_weight:float=0.5)->torch.Tensor:
+    '''
+    the (N,E) embeddings a tree is built from: the bank's CLIP image embeddings T, the CLIP text embeddings of its
+    captions C, or normalize((1-a) T + a C). All live in CLIP's joint space, so the descent's prompt similarity works
+    for each (for captions it is text-text similarity)
+    '''
+    T=bank["T"].float()
+    if cluster_on=="image":
+        return T
+    if bank.get("C") is None:
+        raise ValueError("bank has no caption embeddings C (run caption.py, or embed.py with --label_column)")
+    C=bank["C"].float()
+    assert C.shape==T.shape,f"caption embeddings {tuple(C.shape)} don't match image embeddings {tuple(T.shape)}"
+    if cluster_on=="caption":
+        return C
+    return torch.nn.functional.normalize((1-caption_weight)*T+caption_weight*C,dim=-1)
+
+
 def main(args):
     bank=torch.load(args.bank,weights_only=False)
-    X,T=bank["X"],bank["T"]
-    print(f"bank {args.bank}: X {tuple(X.shape)} T {tuple(T.shape)}")
+    X=bank["X"]
+    T=cluster_embeddings(bank,args.cluster_on,args.caption_weight)
+    print(f"bank {args.bank}: X {tuple(X.shape)}, clustering on {args.cluster_on} embeddings {tuple(T.shape)}")
+    distinct=len(torch.unique(T,dim=0))
+    if distinct<len(T)//2:
+        print(f"warning: only {distinct} distinct {args.cluster_on} embeddings for {len(T)} images (template captions?), so clusters below that level are arbitrary")
     start=time.time()
     tree=build_tree(T,args.pca_dim,args.branching,args.k_min,args.k_max,args.silhouette_sample,args.c_build,args.n_init,args.seed,
                     args.cluster_method,args.dbscan_min_samples,args.dbscan_quantile,args.linkage,args.dbscan_noise)
     tree=add_node_stats(tree,X,T,args.vae_stats)
     tree["bank"]=args.bank
+    tree["cluster_on"]=args.cluster_on
     tree["args"]=vars(args)
     n_nodes=len(tree["children"])
     n_internal=int((tree["internal_index"]>=0).sum())

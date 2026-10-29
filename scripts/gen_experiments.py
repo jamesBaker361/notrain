@@ -67,13 +67,18 @@ STAGES=["build","tree","train","sample","sample_tree","sample_nets","agreement",
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
     sys.exit(f"usage: python scripts/gen_experiments.py <stage> [setting ...]\n  stages: {' '.join(STAGES)}\n  settings: {' '.join(SETTINGS)}\n  got stage={stage!r} settings={settings}")
 
-# trees to build and sample; kmeans keeps the original file/run names, others get a _<method> suffix
-cluster_methods=["kmeans"]
+# trees to build and sample; kmeans keeps the original file/run names, others get a _<name> suffix
+# *_caption trees cluster the CLIP text embeddings of the captions instead of the images, *_mix a 50/50 blend;
+# CIFAR-10's captions are one template per class, so caption trees there are only 10 real clusters (use mix)
+cluster_methods=["dbscan","agglomerative"]
 cluster_flags={
     "kmeans":"--cluster_method kmeans --branching silhouette",
     "dbscan":"--cluster_method dbscan --dbscan_min_samples 5 --dbscan_quantile 0.5",
     "agglomerative":"--cluster_method agglomerative --linkage ward",
 }
+for m in list(cluster_flags):
+    cluster_flags[f"{m}_caption"]=cluster_flags[m]+" --cluster_on caption"
+    cluster_flags[f"{m}_mix"]=cluster_flags[m]+" --cluster_on mix --caption_weight 0.5"
 # --c_search 1 so the descent only stops at the depth cutoff (or at a leaf); depth 0 = no tree (the paper's setting),
 # depth 99 = always a single-image leaf, i.e. a CLIP-guided retrieval baseline
 # CLIP score uses a different CLIP than the one conditioning the descent (the bank's ViT-L/14)

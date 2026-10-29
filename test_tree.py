@@ -1,6 +1,6 @@
 import torch
 import pytest
-from tree import build_tree,add_node_stats,descend,sample_node,tree_sample,node_members,node_size
+from tree import build_tree,add_node_stats,cluster_embeddings,descend,sample_node,tree_sample,node_members,node_size
 
 
 def clustered_bank(n_clusters=4,per_cluster=30,E=16,D=12,seed=0):
@@ -180,3 +180,20 @@ def test_node_stats_from_float16_bank_and_optional():
     node=skipped["children"][0][0]
     out=sample_node(skipped,X,node,4,"diagonal",torch.Generator().manual_seed(0))
     assert out.shape==(4,X.shape[1]) and torch.isfinite(out).all()
+
+
+def test_cluster_on_captions():
+    # images are mixed, but captions separate the clusters: a caption tree recovers them, descent follows the prompt
+    X,T,centers,labels=clustered_bank()
+    T_img=torch.nn.functional.normalize(torch.randn(T.shape,generator=torch.Generator().manual_seed(1)),dim=-1)
+    bank={"X":X,"T":T_img,"C":T}
+    assert torch.equal(cluster_embeddings(bank,"image"),T_img) and torch.equal(cluster_embeddings(bank,"caption"),T)
+    mix=cluster_embeddings(bank,"mix",0.25)
+    assert torch.allclose(mix,torch.nn.functional.normalize(0.75*T_img+0.25*T,dim=-1)) and torch.allclose(mix.norm(dim=-1),torch.ones(len(T)))
+    E=cluster_embeddings(bank,"caption")
+    tree=add_node_stats(build_tree(E,pca_dim=8,branching="silhouette",k_max=6,c_build=10,n_init=2),X,E)
+    assert all(len(set(labels[node_members(tree,k)].tolist()))==1 for k in tree["children"][0])
+    node=descend(tree,centers[1],w=1e4,logit_scale=100.0,max_depth=5,c_search=20,generator=torch.Generator().manual_seed(0))
+    assert set(labels[node_members(tree,node)].tolist())=={1}
+    with pytest.raises(ValueError):
+        cluster_embeddings({"X":X,"T":T_img},"caption")

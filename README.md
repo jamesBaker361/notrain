@@ -47,7 +47,7 @@ python -m pytest test_cfdm.py
 
 ## CLIP tree
 
-`tree.py` builds a hierarchical index over a bank. It runs PCA on the CLIP image embeddings (`--pca_dim`), then clusters in that space with one of three `--cluster_method`s:
+`tree.py` builds a hierarchical index over a bank. It runs PCA on the CLIP image embeddings (`--pca_dim`), then clusters in that space with one of three `--cluster_method`s. `--cluster_on caption` builds it from the CLIP text embeddings of the bank's captions instead, and `--cluster_on mix` from normalize((1−a)·image + a·caption) with a = `--caption_weight`. Node means, and so the descent's prompt similarity, use the same embeddings (text-to-text for captions). Template captions (CIFAR-10's "a photo of a {class}") give only one distinct embedding per class, so use `mix` there. In `scripts/gen_experiments.py`, add `<method>_caption` or `<method>_mix` to `cluster_methods`.
 
 - `kmeans` (default): recursive k-means, with k fixed (`--branching 10`) or picked per node by silhouette score (`--branching silhouette`).
 - `dbscan`: recursive DBSCAN. eps is set per node as `--dbscan_quantile` of the distances to each point's `--dbscan_min_samples`-th neighbour, because a fixed eps stops working as nodes get smaller and denser. Noise points join the cluster of their nearest clustered point (`--dbscan_noise nearest`); `group` makes them one extra child instead. Nodes where DBSCAN finds fewer than two groups are split with 2-means.
