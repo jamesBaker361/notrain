@@ -37,6 +37,8 @@ def run_label(args:dict)->str:
         if args["tree_depth"]>=99:
             return "retrieval (leaf)"+cluster
         return f"{args['node_sampler']} L{args['tree_depth']}"+(" (no tree)" if args["tree_depth"]==0 else "")+cluster
+    if args.get("method")=="topk":
+        return f"{args['node_sampler']} K{args['top_k']} (no tree)"
     return f"{args.get('method','cfdm')} scales{args.get('scales')}"
 
 

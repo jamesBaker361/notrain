@@ -16,7 +16,22 @@ import math
 import torch
 
 
-def node_eig(Xn:torch.Tensor,S_global:torch.Tensor=None,shrinkage:float=0.0,ridge:float=0.0,lowrank:bool=None):
+def weighted_center(Xn:torch.Tensor,weights:torch.Tensor=None):
+    '''
+    mean and centered rows whose Gram matrix / (n - 1) is the covariance. With weights (n,) summing to 1, the
+    weighted mean and the weighted covariance n/(n-1) sum_i w_i (x_i - mean)(x_i - mean)^T (rows scaled by
+    sqrt(n w_i)), which is the usual unbiased covariance for uniform weights
+    '''
+    if weights is None:
+        mean=Xn.mean(0)
+        return mean,Xn-mean
+    weights=weights.to(Xn.device,Xn.dtype)
+    mean=weights@Xn
+    return mean,(Xn-mean)*(weights*Xn.shape[0]).sqrt()[:,None]
+
+
+def node_eig(Xn:torch.Tensor,S_global:torch.Tensor=None,shrinkage:float=0.0,ridge:float=0.0,lowrank:bool=None,
+             weights:torch.Tensor=None):
     '''
     mean and eigendecomposition of the node covariance, optionally blended toward a global covariance,
     S = (1 - shrinkage) S_node + shrinkage S_global, plus ridge * v * I, where v is the mean variance of
@@ -27,10 +42,10 @@ def node_eig(Xn:torch.Tensor,S_global:torch.Tensor=None,shrinkage:float=0.0,ridg
     returns (mean (d,), evals (k,), evecs (d,k), floor): S = evecs diag(evals) evecs^T + floor * (I - evecs evecs^T).
     without shrinkage and with n <= d (lowrank=None picks this automatically) this comes from an SVD of the
     n x d node instead of a d x d eigendecomposition, which is what makes pixel space (d = 3*H*W) tractable
+    weights: optional (n,) per-image weights summing to 1 (e.g. text-weighted top-K sets): weighted mean and covariance
     '''
     n,d=Xn.shape
-    mean=Xn.mean(0)
-    Xc=Xn-mean
+    mean,Xc=weighted_center(Xn,weights)
     if lowrank is None:
         lowrank=shrinkage==0 and n<=d
     if lowrank:
@@ -239,33 +254,40 @@ def locality_sample_shrunk(groups:list,lam:torch.Tensor,Q:torch.Tensor,shrinkage
 
 
 @torch.no_grad()
-def low_rank_cov(X:torch.Tensor,k:int,device,oversample:int=16,iters:int=2,chunk:int=2048,generator:torch.Generator=None):
+def low_rank_cov(X:torch.Tensor,k:int,device,oversample:int=16,iters:int=2,chunk:int=2048,generator:torch.Generator=None,
+                 weights:torch.Tensor=None):
     '''
     top-k principal components of the rows of X (N,d) by randomized SVD with power iterations, streaming row
     chunks to device, so X can be a large float16 tensor in CPU memory (e.g. a 256px pixel bank or one node of it)
     returns mean (d,), evals (k',) covariance eigenvalues, V (d,k') orthonormal, resid: the average variance in
     the directions left out, (trace(S) - sum(evals)) / (d - k'), so mean diag and trace of the covariance are kept
+    weights: optional (N,) per-row weights summing to 1: weighted mean and covariance (as in weighted_center)
     '''
     N,d=X.shape
+    w=None if weights is None else weights.to(device).float()
     def rows(i):
         return X[i:i+chunk].to(device).float()
     mean=torch.zeros(d,device=device)
     for i in range(0,N,chunk):
-        mean+=rows(i).sum(0)
-    mean/=N
+        mean+=rows(i).sum(0) if w is None else w[i:i+chunk]@rows(i)
+    if w is None:
+        mean/=N
+    def centered(i):
+        r=rows(i)-mean
+        return r if w is None else r*(w[i:i+chunk]*N).sqrt()[:,None]
     total=0.0
     for i in range(0,N,chunk):
-        total+=(rows(i)-mean).pow(2).sum().item()
+        total+=centered(i).pow(2).sum().item()
     trace=total/max(N-1,1)
     l=min(k+oversample,N,d)
     def times(M):
         # Xc @ M for M (d,l)
-        return torch.cat([(rows(i)-mean)@M for i in range(0,N,chunk)])
+        return torch.cat([centered(i)@M for i in range(0,N,chunk)])
     def times_t(Y):
         # Xc^T @ Y for Y (N,l)
         out=torch.zeros(d,Y.shape[1],device=device)
         for i in range(0,N,chunk):
-            out+=(rows(i)-mean).T@Y[i:i+chunk]
+            out+=centered(i).T@Y[i:i+chunk]
         return out
     omega=torch.randn(d,l,device=device,generator=generator)
     Y=torch.linalg.qr(times(omega)).Q

@@ -248,6 +248,16 @@ def add_node_stats(tree:dict,X:torch.Tensor,T:torch.Tensor,vae_stats:str="auto",
     return tree
 
 
+def subset_tree(idx:torch.Tensor)->dict:
+    '''
+    a one-node "tree" whose only node (0) is the bank rows idx, so sample_node can sample any set of images,
+    e.g. the top-K CLIP matches of a prompt (sample.py --method topk)
+    '''
+    idx=idx.cpu()
+    return {"perm":idx,"start":torch.tensor([0]),"end":torch.tensor([len(idx)]),"children":[[]],"parent":torch.tensor([-1]),
+            "depth":torch.tensor([0]),"internal_index":torch.tensor([-1]),"vae_mean":None,"vae_var":None,"n":None}
+
+
 def node_size(tree:dict,node:int)->int:
     return int(tree["end"][node]-tree["start"][node])
 
@@ -284,7 +294,8 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
     curve: a P-spline curve through the node's images in TSP order, sampled along (curve.py; locality_kwargs["curve"]:
     max_points, n_knots, degree, smooth, grid, mode, tsp, kicks, log_prior, w; the fitted curve is cached per node)
     locality_kwargs: tau, steps, shrinkage, S_global, ridge, log_prior (over all bank rows), w, and cache, a dict
-    reused across calls so each node's eigendecomposition is computed once
+    reused across calls so each node's eigendecomposition is computed once; weights: optional (n_members,) weights
+    summing to 1 for the locality/wiener statistics (weighted mean and covariance; the cache must then be per weights)
     device: where to sample (default X's device); X may stay on the CPU (e.g. a float16 256px pixel bank),
     only the node's images are moved
     '''
@@ -297,7 +308,7 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         cache=kwargs.get("cache",{})
         key=("lowrank",node,kwargs.get("shrinkage",0.0),kwargs.get("ridge",0.0),kwargs["wiener_rank"])
         if key not in cache:
-            cache[key]=LowRankWiener(low_rank_cov(X[members.to(X.device)],kwargs["wiener_rank"],device),
+            cache[key]=LowRankWiener(low_rank_cov(X[members.to(X.device)],kwargs["wiener_rank"],device,weights=kwargs.get("weights")),
                                      kwargs.get("global_lowrank"),kwargs.get("shrinkage",0.0),kwargs.get("ridge",0.0))
         return wiener_lowrank_sample(n,cache[key],kwargs.get("steps",10),generator=generator)
     if node_sampler=="curve" and len(members)>1:
@@ -351,13 +362,14 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         shrinkage=kwargs.pop("shrinkage",0.0)
         ridge=kwargs.pop("ridge",0.0)
         S_global=kwargs.pop("S_global",None)
+        weights=kwargs.pop("weights",None)
         for k in ["spectrum","shape","ls_patch_fracs","wiener_rank","global_lowrank","curve"]:
             kwargs.pop(k,None)
         log_prior=kwargs.pop("log_prior",None)
         if log_prior is not None:
             log_prior=torch.log_softmax(log_prior[members.to(log_prior.device)].to(device),dim=-1)
         if (node,shrinkage,ridge) not in cache:
-            cache[(node,shrinkage,ridge)]=node_eig(Xn,S_global,shrinkage,ridge)
+            cache[(node,shrinkage,ridge)]=node_eig(Xn,S_global,shrinkage,ridge,weights=weights)
         return locality_sample(n,Xn,cache[(node,shrinkage,ridge)],node_sampler,log_prior=log_prior,generator=generator,**kwargs)
     if node_sampler=="ls":
         # Kamb & Ganguli local score machine over the node's images, with a patch-size schedule

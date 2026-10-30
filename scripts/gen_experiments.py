@@ -18,9 +18,10 @@
 #   class-sorted; 30k bank + 2k held out) rather than its 20GB train split
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
-# usage: python scripts/gen_experiments.py build|tree|train|sample_tree|sample_nets|agreement|summarize [setting ...]
+# usage: python scripts/gen_experiments.py build|tree|train|sample_tree|sample_topk|sample_nets|agreement|summarize [setting ...]
 # (tree = only the tree jobs, for banks that already exist, e.g. after adding to cluster_methods)
-# (sample = sample_tree + sample_nets); sample_tree only needs build, sample_nets and agreement need train
+# (sample = sample_tree + sample_topk + sample_nets); sample_tree and sample_topk only need build, sample_nets and agreement need train
+# sample_topk: no tree, each sampler on the prompt's top-K CLIP matches (K in topk_values), weighted by the text prior
 # make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tree slurm_chip/train slurm_chip/sample slurm_chip/agreement
 # FID/KID need torch-fidelity in the cluster env: pip install torch-fidelity
 import os
@@ -141,10 +142,12 @@ for data,flags,caption,steps in [
 for cfg in SETTINGS.values():
     cfg["methods"]=cfg["methods"]+["curve"]
 settings=sys.argv[2:] or list(SETTINGS)
-STAGES=["build","tree","train","sample","sample_tree","sample_nets","agreement","summarize","all"]
+STAGES=["build","tree","train","sample","sample_tree","sample_topk","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
     sys.exit(f"usage: python scripts/gen_experiments.py <stage> [setting ...]\n  stages: {' '.join(STAGES)}\n  settings: {' '.join(SETTINGS)}\n  got stage={stage!r} settings={settings}")
 
+# top-K set sizes for sample_topk (the tree-free alternative to the depth cutoff)
+topk_values=[50,200,1000]
 # trees to build and sample; kmeans keeps the original file/run names, others get a _<name> suffix
 # *_caption trees cluster the CLIP text embeddings of the captions instead of the images, *_mix a 50/50 blend;
 # CIFAR-10's captions are one template per class, so caption trees there are only 10 real clusters (use mix)
@@ -228,6 +231,14 @@ for name in settings:
                         continue
                     extra=cfg.get("extra",{}).get(method,"")
                     print(sbatch(f"{method}_L{depth}{suffix}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} --output_dir outputs/{run}"))
+    if stage in ["sample","sample_topk","all"]:
+        for k in topk_values:
+            for method in cfg["methods"]:
+                run=f"{name}_{method}_K{k}"
+                if finished(f"outputs/{run}"):
+                    continue
+                extra=cfg.get("extra",{}).get(method,"")
+                print(sbatch(f"{method}_K{k}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method topk --top_k {k} --w 0 1 4 {metrics} {method_flags[method]} {extra} --output_dir outputs/{run}"))
     if stage in ["sample","sample_nets","all"]:
         for kind,spec in nets.items():
             # the as-is checkpoint is unconditional, so only w=0 means anything; the cross-attention nets use w as the CFG scale

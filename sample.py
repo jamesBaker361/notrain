@@ -17,7 +17,7 @@ from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from cfdm import text_log_prior,top_k_subset,sample,sample_multiscale,median_patch_distance
 from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil
-from tree import tree_sample,node_size
+from tree import tree_sample,node_size,sample_node,subset_tree
 from locality import global_spectrum
 from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,prompt_accuracy
 
@@ -37,7 +37,7 @@ parser.add_argument("--patch_sigma",type=float,default=0.0,help="smoothing at th
 parser.add_argument("--patch_positions",type=str,default="any",choices=["any","same"],help="whether a region can draw patches from every grid position or only its own")
 parser.add_argument("--schedule",type=str,default="coarse_to_fine",choices=["coarse_to_fine","fine_to_coarse","constant"])
 parser.add_argument("--scale_weights",type=float,nargs="+",default=None,help="per-scale weights for --schedule constant")
-parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","tree","net"],help="tree: descend a CLIP tree built by tree.py, then sample from the node; net: sample a trained diffusion model (--model)")
+parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","tree","topk","net"],help="tree: descend a CLIP tree built by tree.py, then sample from the node; topk: no tree, sample from the prompt's --top_k CLIP matches with --node_sampler, each image weighted by softmax(w * log p(image | prompt)) (w=0: the K images unweighted); net: sample a trained diffusion model (--model)")
 parser.add_argument("--model",type=str,default="",help="--method net: 'pretrained:<repo>' (e.g. pretrained:google/ddpm-cifar10-32, as-is), a finetune.py path prefix (cross-attention models use the prompt with w as the CFG scale), or an --unconditional train.py prefix")
 parser.add_argument("--bank_device",type=str,default="auto",choices=["auto","cpu","cuda"],help="where the bank lives; auto keeps banks over 4GB (e.g. 256px pixels) in CPU memory and moves only what's needed")
 parser.add_argument("--tree",type=str,default="",help="tree built by tree.py for this bank")
@@ -109,11 +109,16 @@ def main(args):
     else:
         eval_model,eval_processor,eval_text_embeds=clip_model,clip_processor,text_embeds
 
-    if args.method=="tree":
-        assert args.tree,"--method tree needs --tree"
-        tree=torch.load(args.tree,weights_only=False)
-        assert tree["n"]==X.shape[0],f"tree was built for {tree['n']} images but the bank has {X.shape[0]}"
+    if args.method=="topk":
+        assert args.top_k>0,"--method topk needs --top_k > 0"
+    if args.method in ["tree","topk"]:
+        if args.method=="tree":
+            assert args.tree,"--method tree needs --tree"
+            tree=torch.load(args.tree,weights_only=False)
+            assert tree["n"]==X.shape[0],f"tree was built for {tree['n']} images but the bank has {X.shape[0]}"
         eig_cache={}
+        # topk: statistics depend on the prompt and w, so each (prompt, w) gets its own cache
+        topk_caches={}
         S_global=None
         spectrum=None
         global_lowrank=None
@@ -130,7 +135,7 @@ def main(args):
             mu=Xf.mean(0)
             S_global=(Xf.T@Xf-Xf.shape[0]*torch.outer(mu,mu))/(Xf.shape[0]-1)
             del Xf
-            if not args.wiener_exact_eig:
+            if not args.wiener_exact_eig and args.method=="tree":
                 # Woodbury path: one eigendecomposition for the run instead of one per node
                 spectrum=global_spectrum(S_global)
                 S_global=None
@@ -165,22 +170,32 @@ def main(args):
         if args.method=="net":
             z0=torch.randn((n,*bank["shape"]),generator=generator,device=device)
             return net.sample(z0,args.steps,net.t_min,prompts[p],w).flatten(1),None,None
+        if args.method in ["tree","topk"]:
+            cfdm_kwargs={"log_prior":log_priors[p],"w":w,"sigma":sigma,"M":args.M,"steps":args.steps,"start_t":args.start_t}
+            locality_kwargs={"tau":args.tau,"steps":args.steps,"shrinkage":args.wiener_shrinkage,"ridge":args.wiener_ridge,
+                             "S_global":S_global,"spectrum":spectrum,"cache":eig_cache,
+                             "shape":bank["shape"],"ls_patch_fracs":args.ls_patch_fracs,
+                             "wiener_rank":args.wiener_rank,"global_lowrank":global_lowrank,
+                             "log_prior":log_priors[p] if args.node_text_prior else None,"w":w,
+                             "curve":{"max_points":args.curve_max_points,"n_knots":args.curve_knots,"degree":args.curve_degree,"smooth":args.curve_smooth,
+                                      "grid":args.curve_grid,"mode":args.curve_mode,"tsp":args.tsp,"kicks":args.tsp_kicks,
+                                      "steps":args.steps,"log_prior":log_priors[p],"w":w}}
         if args.method=="tree":
             # w sets the descent sharpness (0 = uniform random walk), so no top-k subset is used
             out,nodes=tree_sample(tree,X,text_embeds[p],n,w,bank["logit_scale"],args.tree_depth,
-                                  args.c_search,args.node_sampler,generator,
-                                  cfdm_kwargs={"log_prior":log_priors[p],"w":w,"sigma":sigma,"M":args.M,
-                                               "steps":args.steps,"start_t":args.start_t},
-                                  locality_kwargs={"tau":args.tau,"steps":args.steps,"shrinkage":args.wiener_shrinkage,"ridge":args.wiener_ridge,
-                                                   "S_global":S_global,"spectrum":spectrum,"cache":eig_cache,
-                                                   "shape":bank["shape"],"ls_patch_fracs":args.ls_patch_fracs,
-                                                   "wiener_rank":args.wiener_rank,"global_lowrank":global_lowrank,
-                                                   "log_prior":log_priors[p] if args.node_text_prior else None,"w":w,
-                                                   "curve":{"max_points":args.curve_max_points,"n_knots":args.curve_knots,"degree":args.curve_degree,"smooth":args.curve_smooth,
-                                                            "grid":args.curve_grid,"mode":args.curve_mode,"tsp":args.tsp,"kicks":args.tsp_kicks,
-                                                            "steps":args.steps,"log_prior":log_priors[p],"w":w}},
-                                  device=device)
+                                  args.c_search,args.node_sampler,generator,cfdm_kwargs=cfdm_kwargs,
+                                  locality_kwargs=locality_kwargs,device=device)
             return out,nodes,None
+        if args.method=="topk":
+            # the prompt's top-K CLIP matches as one node; wiener/locality statistics weighted by softmax(w * log prior)
+            # (cfdm and curve weight by the same prior themselves); w=0 keeps the K images unweighted
+            idx=top_idx[p]
+            weights=torch.softmax(w*log_priors[p][idx].float(),dim=-1)
+            locality_kwargs["weights"]=weights
+            locality_kwargs["cache"]=topk_caches.setdefault((p,w),{})
+            out=sample_node(subset_tree(idx),X,0,n,args.node_sampler,generator,cfdm_kwargs,locality_kwargs,device)
+            prior_mass=torch.softmax(w*log_priors[p],dim=-1)[idx].sum().item()
+            return out,None,prior_mass
         X_sub,log_prior,idx=top_k_subset(X,log_priors[p],args.top_k)
         if w==0:
             # unconditional baseline: the top-k subset would itself be text conditioning
