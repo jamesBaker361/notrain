@@ -349,11 +349,16 @@ def sample_node(tree:dict,X:torch.Tensor,node:int,n:int,node_sampler:str="lowran
         a=randn(n,Xn.shape[0])
         return mean+a@(Xn-mean)/math.sqrt(Xn.shape[0]-1)
     if node_sampler=="cfdm":
-        from cfdm import sample
+        from cfdm import sample,sample_multiscale
         kwargs=dict(cfdm_kwargs or {})
         log_prior=kwargs.pop("log_prior",None)
+        # multiscale: {scales, shape, sigmas, schedule, ...} for sample_multiscale (sigmas replaces sigma)
+        multiscale=kwargs.pop("multiscale",None)
         if log_prior is not None:
             log_prior=torch.log_softmax(log_prior[members.to(log_prior.device)].to(device),dim=-1)
+        if multiscale:
+            kwargs.pop("sigma",None)
+            return sample_multiscale(n,Xn,log_prior=log_prior,generator=generator,**kwargs,**multiscale)
         return sample(n,Xn,log_prior,generator=generator,**kwargs)
     if node_sampler in ["locality","wiener"]:
         from locality import node_eig,locality_sample

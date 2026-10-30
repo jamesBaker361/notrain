@@ -60,3 +60,39 @@ def test_weights_pull_wiener_toward_heavy_image():
     uniform=sample_node(subset_tree(idx),X,0,64,"wiener",torch.Generator().manual_seed(0),
                         locality_kwargs={"steps":10,"cache":{},"weights":torch.full((10,),0.1)})
     assert (out.mean(0)-X[4]).norm()<0.5*(uniform.mean(0)-X[4]).norm()
+
+
+def test_switch_schedule_and_visual_patches():
+    from cfdm import scale_weights,sample_multiscale
+    assert scale_weights(0.2,2,"switch",0.2)==[1.0,0.0] and scale_weights(0.59,2,"switch",0.2)==[1.0,0.0]
+    assert scale_weights(0.61,2,"switch",0.2)==[0.0,1.0] and scale_weights(0.9,3,"switch",0.2,switch_frac=0.75)==[0.0,0.0,1.0]
+    g=torch.Generator().manual_seed(0)
+    shape=(1,4,4)
+    X=torch.randn(6,16,generator=g)
+    # a text prior that strongly prefers image 0: with text patch priors the patch phase drifts toward image 0's
+    # patches, with visual-only patches it keeps what the whole-image phase locked onto
+    log_prior=torch.log_softmax(torch.tensor([20.0,0,0,0,0,0]),-1)
+    out=sample_multiscale(8,X,shape,[1,2],log_prior,w=0.0,steps=40,start_t=0.2,schedule="switch",patch_prior="none",
+                          generator=torch.Generator().manual_seed(1))
+    # unsmoothed patch k_t snaps every quarter to a real quarter of some image
+    from cfdm import patchify
+    cand=patchify(X,shape,2).reshape(-1,4)
+    assert torch.cdist(patchify(out,shape,2).reshape(-1,4),cand).min(-1).values.max()<1e-3
+
+
+def test_topk_cfdm_multiscale_through_sample_node():
+    g=torch.Generator().manual_seed(0)
+    shape=(3,8,8)
+    X=torch.randn(40,3*8*8,generator=g)
+    idx=torch.arange(10)
+    log_prior=torch.log_softmax(torch.randn(40,generator=g),-1)
+    kw={"log_prior":log_prior,"w":1.0,"sigma":0.0,"M":1,"steps":100,"start_t":0.2,
+        "multiscale":{"shape":shape,"scales":[1,4],"sigmas":[0.0,0.0],"schedule":"switch","constant_weights":None,
+                      "positions":"any","patch_prior":"none","switch_frac":0.5}}
+    out=sample_node(subset_tree(idx),X,0,5,"cfdm",torch.Generator().manual_seed(1),kw)
+    assert out.shape==(5,X.shape[1]) and torch.isfinite(out).all()
+    from cfdm import patchify
+    P=3*2*2
+    cand=patchify(X[idx],shape,4).reshape(-1,P)
+    # every 2x2 patch comes from one of the K images (any position)
+    assert torch.cdist(patchify(out,shape,4).reshape(-1,P),cand).min(-1).values.max()<1e-2*torch.cdist(cand,cand).median()

@@ -135,7 +135,8 @@ def sample(n:int,X:torch.Tensor,log_prior:torch.Tensor=None,w:float=1.0,sigma:fl
 multiscale patch CFDM: at scale s the (C,H,W) point is cut into an s x s grid of patches, and each
 patch region gets its own closed-form k_t over candidate patches from the bank images, taken either
 from every grid position (positions="any") or only from the same position (positions="same");
-each candidate keeps its parent image's text prior. The per-scale k_t's are
+each candidate keeps its parent image's text prior (or, with patch_prior="none", candidates are weighted by
+visual similarity alone: the k_t distance between the noisy patch and each candidate). The per-scale k_t's are
 blended with weights alpha_s(t), so different regions can pull toward patches of different images.
 Only scale 1 is the exact score of a distribution; the patch scales are a local-score heuristic.
 '''
@@ -173,10 +174,12 @@ def patch_bank(X:torch.Tensor,shape:tuple,s:int,log_prior:torch.Tensor=None):
     return patches,torch.log_softmax(log_prior.repeat_interleave(s*s),dim=-1)
 
 
-def scale_weights(t:float,n_scales:int,schedule:str="coarse_to_fine",start_t:float=0.0,constant:list=None)->list:
+def scale_weights(t:float,n_scales:int,schedule:str="coarse_to_fine",start_t:float=0.0,constant:list=None,
+                  switch_frac:float=0.5)->list:
     '''
     alpha_s(t), summing to 1. coarse_to_fine moves linearly (hat functions) from the first scale at
-    start_t to the last scale at t=1; fine_to_coarse is the reverse; constant uses the given weights
+    start_t to the last scale at t=1; fine_to_coarse is the reverse; constant uses the given weights;
+    switch uses only the first scale for the first switch_frac of [start_t,1], then only the last scale
     '''
     if n_scales==1:
         return [1.0]
@@ -184,6 +187,8 @@ def scale_weights(t:float,n_scales:int,schedule:str="coarse_to_fine",start_t:flo
         total=sum(constant)
         return [c/total for c in constant]
     u=min(max((t-start_t)/(1-start_t),0.0),1.0)
+    if schedule=="switch":
+        return [1.0]+[0.0]*(n_scales-1) if u<switch_frac else [0.0]*(n_scales-1)+[1.0]
     if schedule=="fine_to_coarse":
         u=1-u
     pos=u*(n_scales-1)
@@ -268,24 +273,29 @@ def patch_initial_sample(n:int,bank:dict,start_t:float,w:float=1.0,generator:tor
 @torch.no_grad()
 def sample_multiscale(n:int,X:torch.Tensor,shape:tuple,scales:list=(1,2,4),log_prior:torch.Tensor=None,w:float=1.0,
                       sigmas:list=None,M:int=1,steps:int=50,start_t:float=0.0,schedule:str="coarse_to_fine",
-                      constant_weights:list=None,positions:str="any",generator:torch.Generator=None,return_trajectory:bool=False):
+                      constant_weights:list=None,positions:str="any",patch_prior:str="text",switch_frac:float=0.5,
+                      generator:torch.Generator=None,return_trajectory:bool=False):
     '''
     same Euler scheme as sample(), with k_t replaced by the scale-blended patch k_t
     X: (N,D) bank images (e.g. the top-k CLIP matches), shape: (C,H,W), sigmas: absolute smoothing per scale
     positions: "any" lets a region draw patches from every grid position, "same" only from its own
     the start at start_t is drawn from whichever scale has the most weight then: a whole image picked by
     the CLIP prior for scale 1, otherwise an independent prior-weighted patch per region
+    patch_prior: "text" gives each candidate patch its parent's text prior, "none" only the whole-image scale
+    (patches are then matched by visual similarity alone); switch_frac: see scale_weights
     '''
     assert 0<=start_t<1,"start_t must be in [0,1)"
+    assert patch_prior in ["text","none"],f"unknown patch_prior {patch_prior}"
     banks=[]
     for s in scales:
+        prior=log_prior if s==1 or patch_prior=="text" else None
         if positions=="same":
             patches=patchify(X,shape,s)
-            patch_prior=None if log_prior is None else torch.log_softmax(log_prior,dim=-1)
+            bank_prior=None if prior is None else torch.log_softmax(prior,dim=-1)
         else:
-            patches,patch_prior=patch_bank(X,shape,s,log_prior)
-        banks.append({"s":s,"shape":shape,"positions":positions,"patches":patches,"log_prior":patch_prior,"x_sq":patches.pow(2).sum(-1)})
-    start_alphas=scale_weights(start_t,len(scales),schedule,start_t,constant_weights)
+            patches,bank_prior=patch_bank(X,shape,s,prior)
+        banks.append({"s":s,"shape":shape,"positions":positions,"patches":patches,"log_prior":bank_prior,"x_sq":patches.pow(2).sum(-1)})
+    start_alphas=scale_weights(start_t,len(scales),schedule,start_t,constant_weights,switch_frac)
     start_bank=banks[max(range(len(scales)),key=lambda j:start_alphas[j])]
     if start_bank["s"]==1:
         z=initial_sample(n,X,start_t,log_prior,w,generator)
@@ -296,7 +306,7 @@ def sample_multiscale(n:int,X:torch.Tensor,shape:tuple,scales:list=(1,2,4),log_p
         ts[0]=1e-4
     trajectory=[z]
     for t,t_next in zip(ts[:-1],ts[1:]):
-        alphas=scale_weights(t,len(scales),schedule,start_t,constant_weights)
+        alphas=scale_weights(t,len(scales),schedule,start_t,constant_weights,switch_frac)
         k=multiscale_k_t(z,banks,t,alphas,w,sigmas,M,generator)
         if t_next>=1.0:
             z=k/t

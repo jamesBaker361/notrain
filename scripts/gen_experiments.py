@@ -152,6 +152,12 @@ if stage not in STAGES or any(s not in SETTINGS for s in settings):
 
 # top-K set sizes for sample_topk (the tree-free alternative to the depth cutoff)
 topk_values=[50,200,1000]
+# extra top-K cfdm runs: whole image for the first half of sampling, then one (s2 = quarters) or two (s4 = 16ths)
+# scales finer, with the patches matched by visual similarity (no text prior below the whole-image scale)
+topk_cfdm_variants={
+    "cfdm_s2":"--scales 1 2 --schedule switch --switch_frac 0.5 --patch_prior none",
+    "cfdm_s4":"--scales 1 4 --schedule switch --switch_frac 0.5 --patch_prior none",
+}
 # trees to build and sample; kmeans keeps the original file/run names, others get a _<name> suffix
 # *_caption trees cluster the CLIP text embeddings of the captions instead of the images, *_mix a 50/50 blend;
 # CIFAR-10's captions are one template per class, so caption trees there are only 10 real clusters (use mix)
@@ -247,6 +253,11 @@ for name in settings:
                     continue
                 extra=cfg.get("extra",{}).get(method,"")
                 print(sbatch(f"{method}_K{k}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method topk --top_k {k} --w 0 1 4 {metrics} {method_flags[method]} {extra} {sharp_flags} --output_dir outputs/{run}"))
+            for variant,flags in topk_cfdm_variants.items():
+                run=f"{name}_{variant}_K{k}{sharp_suffix}"
+                if finished(f"outputs/{run}"):
+                    continue
+                print(sbatch(f"{variant}_K{k}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method topk --top_k {k} --w 0 1 4 {metrics} {method_flags['cfdm']} {flags} {sharp_flags} --output_dir outputs/{run}"))
     if stage in ["sample","sample_nets","all"]:
         for kind,spec in nets.items():
             # the as-is checkpoint is unconditional, so only w=0 means anything; the cross-attention nets use w as the CFG scale

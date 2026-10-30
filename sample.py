@@ -35,7 +35,9 @@ parser.add_argument("--top_k",type=int,default=1000,help="restrict to the top-k 
 parser.add_argument("--scales",type=int,nargs="+",default=[1],help="patch grid sizes, coarse to fine, e.g. 1 2 4 = whole, quarters, 16ths")
 parser.add_argument("--patch_sigma",type=float,default=0.0,help="smoothing at the patch scales (>1), as a fraction of the median patch distance at that scale; --sigma applies to the whole-image scale")
 parser.add_argument("--patch_positions",type=str,default="any",choices=["any","same"],help="whether a region can draw patches from every grid position or only its own")
-parser.add_argument("--schedule",type=str,default="coarse_to_fine",choices=["coarse_to_fine","fine_to_coarse","constant"])
+parser.add_argument("--schedule",type=str,default="coarse_to_fine",choices=["coarse_to_fine","fine_to_coarse","constant","switch"],help="switch: only the first scale for the first --switch_frac of the trajectory, then only the last (e.g. --scales 1 2: whole image, then quarters)")
+parser.add_argument("--switch_frac",type=float,default=0.5,help="--schedule switch: fraction of [start_t,1] spent at the first scale")
+parser.add_argument("--patch_prior",type=str,default="text",choices=["text","none"],help="patch scales: candidate patches keep their parent image's text prior, or are matched by visual similarity alone")
 parser.add_argument("--scale_weights",type=float,nargs="+",default=None,help="per-scale weights for --schedule constant")
 parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","tree","topk","net"],help="tree: descend a CLIP tree built by tree.py, then sample from the node; topk: no tree, sample from the prompt's --top_k CLIP matches with --node_sampler, each image weighted by softmax(w * log p(image | prompt)) (w=0: the K images unweighted); net: sample a trained diffusion model (--model)")
 parser.add_argument("--model",type=str,default="",help="--method net: 'pretrained:<repo>' (e.g. pretrained:google/ddpm-cifar10-32, as-is), a finetune.py path prefix (cross-attention models use the prompt with w as the CFG scale), or an --unconditional train.py prefix")
@@ -175,6 +177,10 @@ def main(args):
             return net.sample(z0,args.steps,net.t_min,prompts[p],w).flatten(1),None,None
         if args.method in ["tree","topk"]:
             cfdm_kwargs={"log_prior":log_priors[p],"w":w,"sigma":sigma,"M":args.M,"steps":args.steps,"start_t":args.start_t}
+            if args.scales!=[1]:
+                cfdm_kwargs["multiscale"]={"shape":bank["shape"],"scales":args.scales,"sigmas":sigmas,"schedule":args.schedule,
+                                           "constant_weights":args.scale_weights,"positions":args.patch_positions,
+                                           "patch_prior":args.patch_prior,"switch_frac":args.switch_frac}
             locality_kwargs={"tau":args.tau,"steps":args.steps,"shrinkage":args.wiener_shrinkage,"ridge":args.wiener_ridge,
                              "S_global":S_global,"spectrum":spectrum,"cache":eig_cache,
                              "shape":bank["shape"],"ls_patch_fracs":args.ls_patch_fracs,
@@ -214,7 +220,8 @@ def main(args):
         else:
             out=sample_multiscale(n,X_w,bank["shape"],args.scales,log_prior_w,w=w,sigmas=sigmas,M=args.M,
                                   steps=args.steps,start_t=args.start_t,schedule=args.schedule,
-                                  constant_weights=args.scale_weights,positions=args.patch_positions,generator=generator)
+                                  constant_weights=args.scale_weights,positions=args.patch_positions,patch_prior=args.patch_prior,
+                                  switch_frac=args.switch_frac,generator=generator)
         return out,None,prior_mass
 
     def nearest_train(out:torch.Tensor)->torch.Tensor:
