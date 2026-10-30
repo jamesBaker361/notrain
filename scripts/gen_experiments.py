@@ -24,9 +24,13 @@
 # sample_topk: no tree, each sampler on the prompt's top-K CLIP matches (K in topk_values), weighted by the text prior
 # make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tree slurm_chip/train slurm_chip/sample slurm_chip/agreement
 # FID/KID need torch-fidelity in the cluster env: pip install torch-fidelity
+# SHARPEN=1 python scripts/gen_experiments.py sample_topk ...: the sample runs again into outputs/<run>_sharp with
+# before/after-unsharp-mask grids (radius 1 px up to 64px output, 2 px above); metrics are the same as the plain runs
 import os
+import re
 import sys
 stage=sys.argv[1] if len(sys.argv)>1 else "all"
+sharpen=os.environ.get("SHARPEN","")=="1"
 
 WIKIART_DATA="--dataset huggan/wikiart --data_files 'data/train-0000*.parquet' 'data/train-0001*.parquet' --holdout 1000 --metadata_columns artist genre style"
 WIKIART_CAPTION="--caption_template '{blip}, {style} {genre} by {artist}'"
@@ -193,6 +197,10 @@ for name in settings:
     nets={"pretrained":f"pretrained:{cfg['base']}","ft":f"weights/{name}_ft/ema","scratch":f"weights/{name}_scratch/ema"}
     nets={k:v for k,v in nets.items() if k in cfg.get("nets",nets)}
     size=f"--sample_size {cfg['sample_size']}" if cfg.get("sample_size") else ""
+    # SHARPEN=1: separate *_sharp runs (so finished plain runs don't block them) that also show unsharp-masked samples
+    resolution=int(re.search(r"--resolution (\d+)",cfg["embed"]).group(1)) if "--resolution" in cfg["embed"] else 32
+    sharp_suffix="_sharp" if sharpen else ""
+    sharp_flags=f"--unsharp_amount 1.0 --unsharp_radius {1.0 if resolution<=64 else 2.0}" if sharpen else ""
     if cfg.get("channels"):
         size+=f" --channels {cfg['channels']}"
     if stage in ["build","all"]:
@@ -226,27 +234,27 @@ for name in settings:
                     if depth==99 and method!="cfdm":
                         # every sampler returns the leaf's image, so one retrieval run is enough
                         continue
-                    run=f"{name}_{method}_L{depth}{suffix}" if depth!=99 else f"{name}_retrieval{suffix}"
+                    run=(f"{name}_{method}_L{depth}{suffix}" if depth!=99 else f"{name}_retrieval{suffix}")+sharp_suffix
                     if finished(f"outputs/{run}"):
                         continue
                     extra=cfg.get("extra",{}).get(method,"")
-                    print(sbatch(f"{method}_L{depth}{suffix}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} --output_dir outputs/{run}"))
+                    print(sbatch(f"{method}_L{depth}{suffix}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} {sharp_flags} --output_dir outputs/{run}"))
     if stage in ["sample","sample_topk","all"]:
         for k in topk_values:
             for method in cfg["methods"]:
-                run=f"{name}_{method}_K{k}"
+                run=f"{name}_{method}_K{k}{sharp_suffix}"
                 if finished(f"outputs/{run}"):
                     continue
                 extra=cfg.get("extra",{}).get(method,"")
-                print(sbatch(f"{method}_K{k}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method topk --top_k {k} --w 0 1 4 {metrics} {method_flags[method]} {extra} --output_dir outputs/{run}"))
+                print(sbatch(f"{method}_K{k}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method topk --top_k {k} --w 0 1 4 {metrics} {method_flags[method]} {extra} {sharp_flags} --output_dir outputs/{run}"))
     if stage in ["sample","sample_nets","all"]:
         for kind,spec in nets.items():
             # the as-is checkpoint is unconditional, so only w=0 means anything; the cross-attention nets use w as the CFG scale
             ws="0" if kind=="pretrained" else "0 1 4"
-            run=f"{name}_net_{kind}"
+            run=f"{name}_net_{kind}{sharp_suffix}"
             if finished(f"outputs/{run}"):
                 continue
-            print(sbatch(f"net_{kind}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method net --model {spec} --steps 50 --w {ws} {metrics} --output_dir outputs/{run}"))
+            print(sbatch(f"net_{kind}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method net --model {spec} --steps 50 --w {ws} {metrics} {sharp_flags} --output_dir outputs/{run}"))
     if stage in ["agreement","all"] and not finished(f"outputs/agreement_{name}","agreement.json"):
         # target: the net trained from scratch on exactly our bank; the checkpoint and its fine-tune as "another DDPM"
         others=" ".join(v for k,v in nets.items() if k!="scratch")
