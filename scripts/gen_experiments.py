@@ -155,8 +155,8 @@ topk_values=[50,200,1000]
 # extra top-K cfdm runs: whole image for the first half of sampling, then one (s2 = quarters) or two (s4 = 16ths)
 # scales finer, with the patches matched by visual similarity (no text prior below the whole-image scale)
 topk_cfdm_variants={
-    "cfdm_s2":"--scales 1 2 --schedule switch --switch_frac 0.5 --patch_prior none",
-    "cfdm_s4":"--scales 1 4 --schedule switch --switch_frac 0.5 --patch_prior none",
+    "cfdm_s2":"--scales 1 2 --schedule switch --switch_frac 0.5 --patch_prior none --project_name notrain_scale",
+    "cfdm_s4":"--scales 1 4 --schedule switch --switch_frac 0.5 --patch_prior none --project_name notrain_scale",
 }
 # trees to build and sample; kmeans keeps the original file/run names, others get a _<name> suffix
 # *_caption trees cluster the CLIP text embeddings of the captions instead of the images, *_mix a 50/50 blend;
