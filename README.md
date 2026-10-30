@@ -37,6 +37,8 @@ python -m pytest test_cfdm.py
 
 `--sigma` is a fraction of the median pairwise distance between bank points. At about 0.1 or below, samples are copies of training images. From about 0.25 up, samples are barycenters of M-tuples of training points.
 
+Averaged samples can look blurry. `--unsharp_amount 1.0` (with `--unsharp_radius`, a Gaussian sigma in pixels, and `--unsharp_threshold`) adds each row again after an unsharp mask, directly under the original, in both the saved grids and wandb. Metrics are still computed on the original samples.
+
 ## Multiscale patches
 
 `--scales 1 2 4` cuts each latent into a 1×1, 2×2 and 4×4 grid. Each patch region gets its own closed-form k_t over patches from the CLIP-retrieved images, with each patch keeping its parent image's text prior. The per-scale k_t's are blended over time by `--schedule` (`coarse_to_fine` by default, with linear hat weights), so different regions can come from different images. This is a local-score heuristic: only scale 1 is the exact score of a distribution.

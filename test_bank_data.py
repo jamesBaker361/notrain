@@ -1,4 +1,5 @@
 import os
+import torch
 from PIL import Image
 from datasets import Dataset,ClassLabel
 from bank import load_images,metadata_strings,compose_caption
@@ -34,3 +35,21 @@ def test_load_images_shards_and_shuffle_are_reproducible(tmp_path):
     assert all(p[0] in (0,80) for p in pixel(a))
     full=load_images("imagefolder","train",data_files=files)
     assert len(full)==10 and sorted(pixel(full))==sorted(pixel(load_images("imagefolder","train",data_files=files,shuffle=True)))
+
+
+def test_unsharp_mask():
+    from bank import unsharp_mask
+    g=torch.Generator().manual_seed(0)
+    flat=torch.full((2,3,16,16),0.2)
+    assert torch.allclose(unsharp_mask(flat,1.0,1.0),flat,atol=1e-6)
+    # a blurry step edge gets steeper (more contrast across it), stays in range, and the shape is kept
+    edge=torch.zeros(1,1,16,16)
+    edge[...,8:]=1.0
+    edge=edge*1.6-0.8
+    soft=torch.nn.functional.avg_pool2d(torch.nn.functional.pad(edge,(1,1,1,1),mode="replicate"),3,1)
+    sharp=unsharp_mask(soft,1.5,1.0)
+    assert sharp.shape==soft.shape and sharp.abs().max()<=1
+    assert (sharp[...,8]-sharp[...,7]).mean()>(soft[...,8]-soft[...,7]).mean()
+    # threshold leaves small noise alone
+    noisy=0.2+0.01*torch.randn(1,3,16,16,generator=g)
+    assert torch.allclose(unsharp_mask(noisy,1.0,1.0,threshold=0.05),noisy)

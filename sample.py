@@ -2,7 +2,7 @@
 sample text-conditioned smoothed CFDM from a bank built by embed.py
 usage: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompt_file prompts/faces.txt --w 0 1 4
    or: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompts "a smiling woman" "a man with a beard" --w 0 1 4
-each output row is: [top CLIP-retrieved training image | samples...] for one (prompt, w)
+each output row is: [top CLIP-retrieved training image | samples...] for one (prompt, w); --unsharp_amount adds the sharpened samples below
 --scales 1 2 4 turns on multiscale patches: whole image, quarters and 16ths, blended over time by --schedule
 '''
 import os
@@ -16,7 +16,7 @@ import numpy as np
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from cfdm import text_log_prior,top_k_subset,sample,sample_multiscale,median_patch_distance
-from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil
+from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask
 from tree import tree_sample,node_size,sample_node,subset_tree
 from locality import global_spectrum
 from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,prompt_accuracy
@@ -69,6 +69,9 @@ parser.add_argument("--dino_copy_threshold",type=float,default=0.95,help="DINO c
 parser.add_argument("--lpips_net",type=str,default="alex",help="LPIPS backbone for perceptual diversity: alex (the standard), vgg or squeeze ('' disables)")
 parser.add_argument("--copy_threshold",type=float,default=1e-2,help="relative distance below which a sample counts as a training copy")
 parser.add_argument("--eval_clip_model",type=str,default="",help="CLIP used for the clip_score metric; defaults to the conditioning CLIP (biased)")
+parser.add_argument("--unsharp_amount",type=float,default=0.0,help="if > 0, also show the samples after an unsharp mask of this strength (e.g. 1.0) under the originals in the grids and wandb; metrics use the originals")
+parser.add_argument("--unsharp_radius",type=float,default=1.0,help="unsharp mask Gaussian sigma in pixels (e.g. 1 at 64px, 2-3 at 256px)")
+parser.add_argument("--unsharp_threshold",type=float,default=0.0,help="unsharp mask: only sharpen where the detail exceeds this (in [0,1] intensity units)")
 parser.add_argument("--seed",type=int,default=123)
 parser.add_argument("--output_dir",type=str,default="outputs")
 parser.add_argument("--project_name",type=str,default="notrain")
@@ -260,6 +263,10 @@ def main(args):
             print(metrics)
             results.append(metrics)
             row=concat_images_horizontally([retrieved]+images)
+            if args.unsharp_amount>0:
+                # before (top) and after (bottom) sharpening
+                sharpened=to_pil(unsharp_mask(pixels,args.unsharp_amount,args.unsharp_radius,args.unsharp_threshold))
+                row=concat_images_vertically([row,concat_images_horizontally([retrieved]+sharpened)])
             rows.append(row)
             if not args.no_wandb:
                 wandb.log({f"{name}/w={w}":wandb.Image(row),**{f"{name}/{k}":v for k,v in metrics.items() if k!="prompt"}})

@@ -2,6 +2,7 @@
 helpers for building and decoding the "bank": training points X (flattened pixels, SD-VAE latents, or the
 VQ latents of CompVis/ldm-celebahq-256) and their CLIP image embeddings T
 '''
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -86,6 +87,27 @@ def to_pil(pixels:torch.Tensor)->list:
     # (B,C,H,W) in [-1,1]
     arr=((pixels.clamp(-1,1)+1)*127.5).round().byte().permute(0,2,3,1).cpu().numpy()
     return [Image.fromarray(a) for a in arr]
+
+
+def unsharp_mask(pixels:torch.Tensor,amount:float=1.0,radius:float=1.0,threshold:float=0.0)->torch.Tensor:
+    '''
+    pixels: (B,C,H,W) in [-1,1] -> sharpened, same range: x + amount * (x - gaussian_blur(x, sigma=radius pixels)),
+    only where |x - blur| exceeds threshold (in [0,1] intensity units, as in PIL's UnsharpMask)
+    '''
+    x=pixels.float()
+    half=max(1,int(math.ceil(3*radius)))
+    k=torch.exp(-0.5*(torch.arange(-half,half+1,device=x.device,dtype=x.dtype)/radius)**2)
+    k=k/k.sum()
+    C=x.shape[1]
+    # separable blur, reflect padding so edges aren't darkened
+    blur=F.pad(x,(half,half,0,0),mode="reflect")
+    blur=F.conv2d(blur,k.view(1,1,1,-1).expand(C,1,1,-1),groups=C)
+    blur=F.pad(blur,(0,0,half,half),mode="reflect")
+    blur=F.conv2d(blur,k.view(1,1,-1,1).expand(C,1,-1,1),groups=C)
+    detail=x-blur
+    if threshold>0:
+        detail=detail*(detail.abs()>2*threshold)
+    return (x+amount*detail).clamp(-1,1)
 
 
 def bank_to_pixels(bank:dict,flat:torch.Tensor,vae:AutoencoderKL=None,batch_size:int=8)->torch.Tensor:
