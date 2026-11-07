@@ -29,6 +29,7 @@
 import os
 import re
 import sys
+import zipfile
 stage=sys.argv[1] if len(sys.argv)>1 else "all"
 sharpen=os.environ.get("SHARPEN","")=="1"
 
@@ -190,6 +191,21 @@ def finished(run_dir:str,result:str="metrics.json")->bool:
     return os.path.exists(os.path.join(run_dir,result))
 
 
+def has_captions(bank:str):
+    '''
+    whether a bank file already has caption.py's captions, without loading it (pixel banks are >10GB): the pickle
+    inside torch.save's zip names every dict key; None if the file can't be read (e.g. still being written)
+    '''
+    try:
+        with zipfile.ZipFile(bank) as z:
+            pkl=next(n for n in z.namelist() if n.endswith("data.pkl"))
+            data=z.read(pkl)
+        # the exact string "captions" (protocol 2 BINUNICODE, or SHORT_BINUNICODE in newer protocols)
+        return b"X\x08\x00\x00\x00captions" in data or b"\x8c\x08captions" in data
+    except (zipfile.BadZipFile,StopIteration,OSError):
+        return None
+
+
 def sbatch(job:str,log:str,cmd:str,dependency:str="",script:str="runpygpu_chip.sh")->str:
     dep=f"--dependency=afterok:{dependency} " if dependency else ""
     return f"sbatch --parsable {dep}-J {job} --err=slurm_chip/{log}.err --out=slurm_chip/{log}.out {script} {cmd}"
@@ -210,15 +226,34 @@ for name in settings:
     if cfg.get("channels"):
         size+=f" --channels {cfg['channels']}"
     if stage in ["build","all"]:
-        # embed -> (BLIP captions) -> tree, each waiting for the previous job
-        embed_args=cfg["embed"]
-        line=f"jid=$({sbatch('embed_'+name,'embed/'+name,f'embed.py {embed_args} --save_path {bank}')})"
-        if cfg["blip"]:
-            caption_cmd=f"caption.py --bank {bank} {cfg.get('caption','')}"
-            line+=f" && jid=$({sbatch('caption_'+name,'caption/'+name,caption_cmd,'$jid')})"
-        for job,log,cmd in tree_jobs:
-            line+=f" && {sbatch(job,log,cmd,'$jid')}"
-        print(line)
+        # embed -> (BLIP captions) -> tree, each waiting for the previous job; steps whose output is already on
+        # disk are skipped (an existing bank isn't re-embedded, a captioned one isn't re-captioned, existing trees
+        # are kept unless the bank is rebuilt), so re-running build only submits what's missing
+        # (jobs still queued or running aren't detected: don't re-run build until they're done)
+        need_embed=not os.path.exists(bank)
+        captioned=False if need_embed else has_captions(bank)
+        jobs=[]
+        if captioned is None:
+            print(f"# {name}: {bank} can't be read (still being written?), skipping its build",file=sys.stderr)
+        elif need_embed:
+            jobs.append(("embed_"+name,"embed/"+name,f"embed.py {cfg['embed']} --save_path {bank}"))
+        if cfg["blip"] and captioned is False:
+            jobs.append(("caption_"+name,"caption/"+name,f"caption.py --bank {bank} {cfg.get('caption','')}"))
+        if captioned is not None:
+            jobs+=[job for job,path in zip(tree_jobs,trees.values()) if need_embed or not os.path.exists(path)]
+            if not jobs:
+                print(f"# {name}: bank, captions and trees already built",file=sys.stderr)
+        # the trees only wait for the bank steps (embed/caption), not for each other
+        parts=[]
+        dep=""
+        for job,log,cmd in jobs:
+            if job.startswith("tree_"):
+                parts.append(sbatch(job,log,cmd,dep))
+            else:
+                parts.append(f"jid=$({sbatch(job,log,cmd,dep)})")
+                dep="$jid"
+        if parts:
+            print(" && ".join(parts))
     if stage=="tree":
         # trees only, for a bank that already exists (e.g. adding a clustering method)
         for job,log,cmd in tree_jobs:
