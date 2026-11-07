@@ -52,6 +52,11 @@ def main(args):
         with open(os.path.join(d,"metrics.json")) as f:
             m=json.load(f)
         runs.append({"dir":d,"args":m["args"],"prompts":m["prompts"],"results":m["results"],"label":run_label(m["args"])})
+    # same settings on different banks (e.g. pixel vs latent) get the same label; tell them apart by run dir
+    labels=[r["label"] for r in runs]
+    for r in runs:
+        if labels.count(r["label"])>1:
+            r["label"]+=f" [{os.path.basename(os.path.normpath(r['dir']))}]"
     # order rows by sampler, then depth
     runs.sort(key=lambda r:(r["args"].get("node_sampler",""),r["args"].get("tree_depth",0),r["dir"]))
     os.makedirs(args.output_dir,exist_ok=True)
