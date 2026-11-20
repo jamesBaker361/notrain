@@ -2,6 +2,7 @@
 helpers for building and decoding the "bank": training points X (flattened pixels, SD-VAE latents, the
 VQ latents of CompVis/ldm-celebahq-256, or FLUX.2 latents) and their CLIP image embeddings T
 '''
+import os
 import math
 import torch
 import torch.nn.functional as F
@@ -168,6 +169,22 @@ def load_images(dataset:str,split:str,limit:int=-1,data_files:list=None,shuffle:
     if limit>0:
         ds=ds.select(range(min(limit,len(ds))))
     return ds
+
+
+def bank_dataset(bank:dict):
+    '''
+    the dataset rows behind the bank's X, in order, from its stored embed.py args (held-out rows of embed.py
+    --holdout come last and are left out)
+    '''
+    embed_args=bank["args"]
+    dataset=load_images(embed_args["dataset"],embed_args["split"],embed_args["limit"],embed_args.get("data_files"),
+                        embed_args.get("shuffle",False),embed_args.get("seed",123))
+    return dataset.select(range(bank["X"].shape[0]))
+
+
+def tokens_path(bank_path:str)->str:
+    # where clip_tokens.py stores a bank's CLIP token embeddings: next to it, too big to live inside it
+    return os.path.splitext(bank_path)[0]+"_tokens.pt"
 
 
 def metadata_strings(ds,column:str)->list:

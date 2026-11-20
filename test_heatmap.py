@@ -1,7 +1,7 @@
 import torch
 import pytest
 from transformers import CLIPConfig,CLIPModel,CLIPImageProcessor
-from heatmap import residual_stream,project,token_heatmaps
+from heatmap import residual_stream,project,token_embeddings
 from bank import to_pil
 
 
@@ -52,11 +52,15 @@ def test_projection_linearizes_layernorm(tiny_clip):
     assert torch.allclose(project(model,r/2,r)*2,project(model,r,r),atol=1e-12)
 
 
-def test_heatmap_shape(tiny_clip):
+def test_token_embeddings(tiny_clip):
     model,pixel_values=tiny_clip
     processor=CLIPImageProcessor(size={"shortest_edge":32},crop_size={"height":32,"width":32})
     images=to_pil(torch.rand(3,3,32,32)*2-1)
-    texts=torch.nn.functional.normalize(torch.randn(5,16,dtype=torch.float64),dim=-1)
-    maps=token_heatmaps(model,processor,images,texts,"cpu",n_layers=2,batch_size=2)
-    assert maps.shape==(3,5,4,4)
-    assert torch.isfinite(maps).all()
+    tokens=token_embeddings(model,processor,images,"cpu",n_layers=2,batch_size=2)
+    assert tokens.shape==(3,4,4,16) and torch.isfinite(tokens).all()
+    # the same as the per-token terms projected one image at a time
+    pv=processor(images=images[2:],return_tensors="pt")["pixel_values"].double()
+    r,contribs=residual_stream(model,pv,2)
+    embed=model.visual_projection(model.vision_model.post_layernorm(r))
+    one=project(model,contribs[:,:,1:].sum(1),r)/embed.norm(dim=-1)[:,None,None]
+    assert torch.allclose(tokens[2].reshape(16,16),one[0].float(),atol=1e-5)

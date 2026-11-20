@@ -3,13 +3,15 @@ coarse-to-fine closed-form sampling: the smoothed CFDM (cfdm.py, Scarvelis et al
 coarsest pyramid level, where averaging a few training images is still plausible, and every finer level adds
 real detail with the closed-form patch denoiser of Qiu et al. ("Efficient and training-free single-image
 diffusion models", the efficient-SID-code submodule), run over the stride-1 patches of the prompt's retrieved
-images instead of a single image.
+images instead of a single image. The bank's CLIP token embeddings (clip_tokens.py) tie the two together: every
+CLIP token covers a g x g cell of the image, and maps at each level to the denoiser patches that overlap it.
 
 Each patch level is a full trajectory from noise. After every denoiser call the clean estimate keeps only its
 own detail band and takes its low frequencies from the finished coarser level (their Laplacian two-scale
 blend), so the patches can sharpen the CFDM layout but never move it. Each candidate patch can carry a bias:
-w * log p(parent image | prompt), plus heatmap_lambda * its standardized CLIP text-heatmap score (heatmap.py),
-and the bank can be cut to the patches with the highest heatmap scores plus a random share of the rest.
+w * log p(parent image | prompt), plus heatmap_lambda * its standardized CLIP text-heatmap score (the
+overlap-weighted mean of the heat of the tokens it covers), and the bank can be cut to the patches that overlap
+the most text-relevant tokens, plus a random share of the rest.
 
 Same time convention as cfdm.py: z_t = t x + (1-t) eps, t=0 is noise and t=1 is clean.
 '''
@@ -54,11 +56,27 @@ def gaussian_window(C:int,p:int,rho:float)->torch.Tensor:
     return torch.outer(g,g).repeat(C,1,1).flatten()
 
 
-def patch_scores(heat:torch.Tensor,p:int)->torch.Tensor:
+def token_overlap(n:int,g:int,p:int)->torch.Tensor:
     '''
-    heat: (K,1,H,W) -> (K,L): mean heat over each stride-1 p x p footprint, in F.unfold's position order
+    (n-p+1,g): along one side of an n-pixel level whose image is split into g CLIP token rows (or columns), the
+    number of pixels each stride-1 p-pixel patch window shares with each token row. Patch (y,x) and token (i,j)
+    share O_y[y,i]*O_x[x,j] pixels
     '''
-    return F.avg_pool2d(heat,p,stride=1).flatten(1)
+    start=torch.arange(n-p+1,dtype=torch.float64)[:,None]
+    edges=torch.arange(g+1,dtype=torch.float64)*n/g
+    return (torch.minimum(start+p,edges[1:])-torch.maximum(start,edges[:-1])).clamp_min(0).float()
+
+
+def token_to_patches(token:torch.Tensor,size:tuple,p:int)->torch.Tensor:
+    '''
+    token: (K,g,g) values on the CLIP token grid -> (K,L): for every stride-1 p x p patch of a size=(H,W) level
+    (F.unfold's position order), the sum of the tokens it overlaps, each weighted by the shared pixel count / p^2;
+    a heatmap becomes each patch's mean heat, a 0/1 token mask its covered fraction
+    '''
+    g=token.shape[-1]
+    O_y=token_overlap(size[0],g,p).to(token)
+    O_x=token_overlap(size[1],g,p).to(token)
+    return torch.einsum("yi,kij,xj->kyx",O_y,token,O_x).flatten(1)/(p*p)
 
 
 def build_patch_bank(images:torch.Tensor,p:int,log_prior:torch.Tensor=None,w:float=1.0,heat:torch.Tensor=None,
@@ -66,9 +84,12 @@ def build_patch_bank(images:torch.Tensor,p:int,log_prior:torch.Tensor=None,w:flo
     '''
     every stride-1 p x p patch of images (K,C,H,W), each with an additive logit bias
         w * log_prior[parent] + heatmap_lambda * standardized heat score
-    keep < 1 keeps that fraction of the patches with the highest heat score plus random_frac of the others
-    (patches the text heatmap calls irrelevant still have to be available: every output region snaps to some
-    patch, so a bank of only relevant patches tiles them everywhere)
+    heat: (K,g,g) text heatmap on each image's CLIP token grid; a patch's score is the overlap-weighted mean
+    heat of the tokens it covers (token_to_patches)
+    keep < 1 keeps that fraction of the tokens, those with the highest heat over all K images, and then every
+    patch that shares at least one pixel with a kept token, plus random_frac of the other patches (patches the
+    text heatmap calls irrelevant still have to be available: every output region snaps to some patch, so a bank
+    of only relevant patches tiles them everywhere)
     returns {patches (M,C*p*p), bias (M,) or None, y_sq (M,), n_total}
     '''
     K=images.shape[0]
@@ -78,20 +99,21 @@ def build_patch_bank(images:torch.Tensor,p:int,log_prior:torch.Tensor=None,w:flo
     bias=None
     if log_prior is not None and w!=0:
         bias=w*log_prior.to(patches).repeat_interleave(L)
-    score=None
-    if heat is not None:
-        score=patch_scores(heat.to(patches),p).flatten()
+    size=images.shape[-2:]
+    if heat is not None and heatmap_lambda!=0:
+        score=token_to_patches(heat.to(patches),size,p).flatten()
         score=(score-score.mean())/score.std().clamp_min(1e-8)
-        if heatmap_lambda!=0:
-            bias=heatmap_lambda*score if bias is None else bias+heatmap_lambda*score
+        bias=heatmap_lambda*score if bias is None else bias+heatmap_lambda*score
     if keep<1:
-        assert score is not None,"heatmap filtering needs heat"
-        order=torch.argsort(score,descending=True)
-        n_keep=max(1,math.ceil(keep*order.numel()))
-        rest=order[n_keep:]
+        assert heat is not None,"heatmap filtering needs heat"
+        flat=heat.to(patches).flatten()
+        kept_tokens=torch.zeros_like(flat)
+        kept_tokens[torch.topk(flat,max(1,math.ceil(keep*flat.numel()))).indices]=1
+        covered=token_to_patches(kept_tokens.reshape(heat.shape),size,p).flatten()>1e-6
+        rest=(~covered).nonzero().squeeze(1)
         n_rand=int(round(random_frac*rest.numel()))
         perm=torch.randperm(rest.numel(),generator=generator,device=generator.device if generator is not None else "cpu")
-        idx=torch.cat([order[:n_keep],rest[perm[:n_rand].to(rest.device)]])
+        idx=torch.cat([covered.nonzero().squeeze(1),rest[perm[:n_rand].to(rest.device)]])
         patches=patches[idx]
         bias=None if bias is None else bias[idx]
     return {"patches":patches,"bias":bias,"y_sq":patches.pow(2).sum(-1),"n_total":K*L}
@@ -170,14 +192,14 @@ def build_pyramid_banks(images:torch.Tensor,coarse_size:int,p:int,log_prior:torc
                         generator:torch.Generator=None)->list:
     '''
     one patch bank per patch level (every level but the coarsest), finest first
-    images: (K,C,H,W) the images supplying patches, heat: (K,1,H,W) or None, resized to each level
+    images: (K,C,H,W) the images supplying patches, heat: (K,g,g) on their CLIP token grids or None; the same
+    tokens are kept at every level, each mapping to the patches that overlap it there
     '''
     sizes=pyramid_sizes(images.shape[-2],images.shape[-1],coarse_size)
     banks=[]
     for size in sizes[:-1]:
         assert min(size)>=p,f"patch_size {p} is larger than the {size[0]}x{size[1]} level"
-        level_heat=None if heat is None else resize(heat.float(),size)
-        banks.append(build_patch_bank(resize(images,size),p,log_prior,w,level_heat,heatmap_lambda,keep,random_frac,generator))
+        banks.append(build_patch_bank(resize(images,size),p,log_prior,w,heat,heatmap_lambda,keep,random_frac,generator))
     return banks
 
 

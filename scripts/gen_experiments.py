@@ -25,7 +25,7 @@
 # usage: python scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement|summarize [setting ...]
 # (sample = sample_closed + sample_nets); sample_closed only needs build, sample_nets and agreement need train
 # sample_closed: the whole-image CFDM on the prompt's top-K CLIP matches, and each pyramid variant (pyramid_variants)
-# make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/train slurm_chip/sample slurm_chip/agreement
+# make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tokens slurm_chip/train slurm_chip/sample slurm_chip/agreement
 # FID/KID need torch-fidelity in the cluster env: pip install torch-fidelity
 # SHARPEN=1 python scripts/gen_experiments.py sample_closed ...: the sample runs again into outputs/<run>_sharp with
 # before/after-unsharp-mask grids (radius 1 px up to 64px output, 2 px above); metrics are the same as the plain runs
@@ -208,9 +208,10 @@ for name in settings:
     if cfg.get("channels"):
         size+=f" --channels {cfg['channels']}"
     if stage in ["build","all"]:
-        # embed -> (BLIP captions), the captions waiting for the bank; steps whose output is already on disk are
-        # skipped (an existing bank isn't re-embedded, a captioned one isn't re-captioned), so re-running build
-        # only submits what's missing
+        # embed -> (BLIP captions) -> CLIP token embeddings (clip_tokens.py, for the pyramid's heatmaps), each waiting
+        # for the one before; steps whose output is already on disk are skipped (an existing bank isn't re-embedded,
+        # a captioned one isn't re-captioned, existing tokens aren't recomputed), so re-running build only submits
+        # what's missing
         # (jobs still queued or running aren't detected: don't re-run build until they're done)
         need_embed=not os.path.exists(bank)
         captioned=False if need_embed else has_captions(bank)
@@ -221,8 +222,10 @@ for name in settings:
             jobs.append(("embed_"+name,"embed/"+name,f"embed.py {cfg['embed']} --save_path {bank}"))
         if cfg["blip"] and captioned is False:
             jobs.append(("caption_"+name,"caption/"+name,f"caption.py --bank {bank} {cfg.get('caption','')}"))
+        if captioned is not None and not os.path.exists(os.path.splitext(bank)[0]+"_tokens.pt"):
+            jobs.append(("tokens_"+name,"tokens/"+name,f"clip_tokens.py --bank {bank}"))
         if captioned is not None and not jobs:
-            print(f"# {name}: bank and captions already built",file=sys.stderr)
+            print(f"# {name}: bank, captions and CLIP tokens already built",file=sys.stderr)
         parts=[]
         dep=""
         for job,log,cmd in jobs:

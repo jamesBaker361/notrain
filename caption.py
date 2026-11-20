@@ -13,7 +13,7 @@ import time
 import torch
 from transformers import BlipForConditionalGeneration, BlipProcessor
 from experiment_helpers.gpu_details import print_details
-from bank import load_clip,encode_texts_clip,load_images,compose_caption
+from bank import load_clip,encode_texts_clip,bank_dataset,compose_caption
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--bank",type=str,default="banks/celeb.pt")
@@ -31,10 +31,7 @@ parser.add_argument("--mixed_precision",type=str,default="fp16",choices=["no","f
 def caption_images(args,bank:dict,torch_dtype,device)->list:
     embed_args=bank["args"]
     # iterate the dataset exactly as embed.py did so captions line up with the bank rows
-    dataset=load_images(embed_args["dataset"],embed_args["split"],embed_args["limit"],embed_args.get("data_files"),
-                        embed_args.get("shuffle",False),embed_args.get("seed",123))
-    # held-out rows (embed.py --holdout) come last and aren't captioned
-    dataset=dataset.select(range(bank["X"].shape[0]))
+    dataset=bank_dataset(bank)
 
     processor=BlipProcessor.from_pretrained(args.captioner)
     captioner=BlipForConditionalGeneration.from_pretrained(args.captioner,torch_dtype=torch_dtype).to(device).eval()

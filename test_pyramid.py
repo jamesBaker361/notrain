@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import pytest
-from pyramid import (pyramid_sizes,downsample_flat,gaussian_window,patch_scores,build_patch_bank,patch_denoise,
+from pyramid import (pyramid_sizes,downsample_flat,gaussian_window,token_overlap,token_to_patches,build_patch_bank,patch_denoise,
                      image_denoise,blend,build_pyramid_banks,sample_pyramid,resize)
 
 
@@ -28,31 +28,45 @@ def test_patch_count_and_prior(images):
     assert torch.allclose(bank["bias"],2.0*prior.repeat_interleave(L))
 
 
-def test_patch_scores_match_unfold(images):
-    x,g=images
-    heat=torch.rand(4,1,16,16,generator=g)
-    assert torch.allclose(patch_scores(heat,5),F.unfold(heat,5).mean(1))
+def test_token_overlap():
+    # 16px side, 4 tokens of 4px, 5px windows: every window covers 5 pixels in total
+    O=token_overlap(16,4,5)
+    assert O.shape==(12,4) and torch.allclose(O.sum(1),torch.full((12,),5.0))
+    assert O[0].tolist()==[4,1,0,0] and O[3].tolist()==[1,4,0,0] and O[4].tolist()==[0,4,1,0]
+    # token edges between pixels (20px, 16 tokens): fractional overlaps, still summing to the window
+    assert torch.allclose(token_overlap(20,16,5).sum(1),torch.full((16,),5.0))
 
 
-def test_heatmap_filter_keeps_top_and_random(images):
+def test_token_to_patches_is_mean_over_covered_pixels(images):
     x,g=images
-    heat=torch.rand(4,1,16,16,generator=g)
+    token=torch.rand(4,4,4,generator=g)
+    # each token painted over its 4x4 pixel cell: a patch's score is the mean of its pixels
+    painted=token.repeat_interleave(4,1).repeat_interleave(4,2)[:,None]
+    assert torch.allclose(token_to_patches(token,(16,16),5),F.unfold(painted,5).mean(1),atol=1e-6)
+    # one token per pixel: the plain mean over each patch's footprint
+    assert torch.allclose(token_to_patches(painted[:,0],(16,16),5),F.unfold(painted,5).mean(1),atol=1e-6)
+
+
+def test_heatmap_filter_keeps_patches_overlapping_kept_tokens(images):
+    x,g=images
+    heat=torch.rand(4,4,4,generator=g)
     full=build_patch_bank(x,5,heat=heat,heatmap_lambda=1.0)
-    score=full["bias"]
-    M=score.numel()
+    M=full["patches"].shape[0]
     top=build_patch_bank(x,5,heat=heat,heatmap_lambda=1.0,keep=0.25)
-    n_keep=-(-M//4)
-    assert top["patches"].shape[0]==n_keep
-    # exactly the highest-scoring patches
-    assert torch.allclose(torch.sort(top["bias"]).values,torch.sort(torch.topk(score,n_keep).values).values)
+    # the top quarter of the 64 tokens, and every 5x5 patch touching one of their 4x4 cells
+    kept=torch.zeros(64)
+    kept[torch.topk(heat.flatten(),16).indices]=1
+    painted=kept.reshape(4,1,4,4).repeat_interleave(4,2).repeat_interleave(4,3)
+    covered=F.unfold(painted,5).amax(1).flatten()>0
+    assert top["patches"].shape[0]==covered.sum()
+    assert torch.equal(torch.sort(top["bias"]).values,torch.sort(full["bias"][covered]).values)
     mixed=build_patch_bank(x,5,heat=heat,heatmap_lambda=1.0,keep=0.25,random_frac=0.5,generator=torch.Generator().manual_seed(1))
-    assert mixed["patches"].shape[0]==n_keep+round(0.5*(M-n_keep))
-    assert mixed["bias"].min()<top["bias"].min()
+    assert mixed["patches"].shape[0]==covered.sum()+round(0.5*(M-covered.sum().item()))
 
 
 def test_heatmap_lambda_standardizes(images):
     x,g=images
-    heat=torch.rand(4,1,16,16,generator=g)*100+7
+    heat=torch.rand(4,4,4,generator=g)*100+7
     bank=build_patch_bank(x,5,heat=heat,heatmap_lambda=1.0)
     assert abs(bank["bias"].mean())<1e-5 and abs(bank["bias"].std()-1)<1e-4
 

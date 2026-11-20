@@ -62,15 +62,16 @@ def project(model:CLIPModel,c:torch.Tensor,r:torch.Tensor)->torch.Tensor:
 
 
 @torch.no_grad()
-def token_heatmaps(model:CLIPModel,processor,images:list,text_embeds:torch.Tensor,device,n_layers:int=4,
-                   batch_size:int=16)->torch.Tensor:
+def token_embeddings(model:CLIPModel,processor,images:list,device,n_layers:int=4,batch_size:int=16)->torch.Tensor:
     '''
-    images: list of PIL images, text_embeds: (P,E) L2-normalized -> (B,P,g,g) heatmaps on the g x g token grid,
-    each image's contributions divided by its embedding norm (so a map sums to roughly its cosine similarity).
-    The processor center-crops, so the grid covers the whole image only for square images.
-    Subtract a mean over several texts before using these: raw maps share a text-independent component
+    images: list of PIL images -> (B,g,g,E): each image token's direct contribution through the last n_layers
+    attention blocks, in the joint embedding space and divided by the image embedding's norm, so
+    <token, text> over the grid sums to roughly the image's cosine similarity with the text. Token (i,j) covers
+    the (i,j) cell of the processor's center crop: the whole image for a square one, and the same crop embed.py
+    takes for X. A heatmap is tokens @ text; subtract its mean over several texts before using it, since raw maps
+    share a text-independent component
     '''
-    maps=[]
+    out=[]
     for i in range(0,len(images),batch_size):
         pixel_values=processor(images=images[i:i+batch_size],return_tensors="pt")["pixel_values"].to(device,model.dtype)
         r,contribs=residual_stream(model,pixel_values,n_layers)
@@ -78,5 +79,5 @@ def token_heatmaps(model:CLIPModel,processor,images:list,text_embeds:torch.Tenso
         # image tokens only: the class token's own term has a negligible direct effect (their mean-ablation)
         tokens=project(model,contribs[:,:,1:].sum(1),r)/embed.norm(dim=-1)[:,None,None]
         g=int(round(tokens.shape[1]**0.5))
-        maps.append((tokens.float()@text_embeds.T.float()).transpose(1,2).reshape(-1,text_embeds.shape[0],g,g))
-    return torch.cat(maps)
+        out.append(tokens.float().reshape(tokens.shape[0],g,g,-1))
+    return torch.cat(out)

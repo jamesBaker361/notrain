@@ -6,6 +6,7 @@ each output row is: [top CLIP-retrieved training image | samples...] for one (pr
 --method cfdm: smoothed CFDM over the prompt's top-k CLIP matches
 --method pyramid: that CFDM at the coarsest pyramid level, then closed-form patch levels up to full resolution (pyramid.py),
     with patches optionally weighted (--heatmap_lambda) and filtered (--heatmap_keep, --heatmap_random) by CLIP text heatmaps
+    from the bank's CLIP token embeddings (clip_tokens.py)
 --method net: a trained diffusion model
 '''
 import os
@@ -19,9 +20,8 @@ import numpy as np
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from cfdm import text_log_prior,top_k_subset,sample,median_distance
-from pyramid import pyramid_sizes,downsample_flat,build_pyramid_banks,sample_pyramid,resize
-from heatmap import token_heatmaps
-from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask
+from pyramid import pyramid_sizes,downsample_flat,build_pyramid_banks,sample_pyramid
+from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask,tokens_path
 from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,prompt_accuracy
 
 parser=argparse.ArgumentParser()
@@ -43,9 +43,9 @@ parser.add_argument("--pyramid_steps",type=int,default=10,help="pyramid: denoisi
 parser.add_argument("--fold_rho",type=float,default=0.2,help="pyramid: width of the Gaussian window overlapping patch estimates are averaged with")
 parser.add_argument("--eta",type=float,default=0.0,help="pyramid: patch-level stochasticity in [0,1] (0 = deterministic DDIM)")
 parser.add_argument("--heatmap_lambda",type=float,default=0.0,help="pyramid: logit bonus per standard deviation of a patch's CLIP text-heatmap score (0 = off)")
-parser.add_argument("--heatmap_keep",type=float,default=1.0,help="pyramid: keep this fraction of patches, those with the highest heatmap scores (1 = all)")
+parser.add_argument("--heatmap_keep",type=float,default=1.0,help="pyramid: keep this fraction of CLIP tokens, those with the highest heat over the patch images, and every patch overlapping a kept token (1 = all)")
 parser.add_argument("--heatmap_random",type=float,default=0.0,help="pyramid: with --heatmap_keep < 1, also keep this random fraction of the other patches")
-parser.add_argument("--heatmap_layers",type=int,default=4,help="pyramid: last attention layers whose direct effects make the heatmap")
+parser.add_argument("--tokens",type=str,default="",help="pyramid heatmaps: the bank's CLIP token embeddings from clip_tokens.py; defaults to <bank>_tokens.pt")
 parser.add_argument("--heatmap_baseline",type=str,nargs="+",default=["a photo.","an image.","a picture."],help="pyramid: generic texts whose heatmaps, with the other prompts', are averaged and subtracted")
 parser.add_argument("--model",type=str,default="",help="--method net: 'pretrained:<repo>' (e.g. pretrained:google/ddpm-cifar10-32, as-is), a finetune.py path prefix (cross-attention models use the prompt with w as the CFG scale), or an --unconditional train.py prefix")
 parser.add_argument("--bank_device",type=str,default="auto",choices=["auto","cpu","cuda"],help="where the bank lives; auto keeps banks over 4GB (e.g. 256px pixels) in CPU memory and moves only what's needed")
@@ -126,6 +126,13 @@ def main(args):
         if heatmap_on:
             # every prompt's heatmaps, minus their mean over all prompts and the generic baseline texts
             heat_texts=torch.cat([text_embeds,encode_texts_clip(clip_model,clip_processor,args.heatmap_baseline,device)])
+            path=args.tokens or tokens_path(args.bank)
+            assert os.path.exists(path),f"heatmaps need the bank's CLIP token embeddings: run clip_tokens.py --bank {args.bank} (missing {path})"
+            # memory-mapped: only the patch images' rows are read
+            bank_tokens=torch.load(path,weights_only=False,mmap=True)
+            assert bank_tokens["clip_model"]==bank["clip_model"] and bank_tokens["tokens"].shape[0]==X.shape[0],\
+                f"{path} doesn't match the bank ({bank_tokens['clip_model']}, {bank_tokens['tokens'].shape[0]} rows)"
+            print(f"CLIP tokens {tuple(bank_tokens['tokens'].shape)} from {path} (last {bank_tokens['n_layers']} layers)")
         pyramid_banks={}
     print(f"median pairwise distance {scale:.4f}, sigma {sigma:.4f}")
 
@@ -148,9 +155,10 @@ def main(args):
             prior=log_priors[p][idx.to(device)]
             heat=None
             if heatmap_on:
-                images=to_pil(bank_to_pixels(bank,X[idx.to(X.device)],vae))
-                maps=token_heatmaps(clip_model,clip_processor,images,heat_texts,device,args.heatmap_layers)
-                heat=resize((maps[:,p]-maps.mean(1))[:,None],shape[1:])
+                # (K,g,g,texts) heatmaps on the patch images' token grids; pyramid.py maps each token to the
+                # patches overlapping it at every level
+                maps=bank_tokens["tokens"][idx].to(device).float()@heat_texts.T
+                heat=maps[...,p]-maps.mean(-1)
         images=X[idx.to(X.device)].to(device).float().reshape(-1,*shape)
         # no heatmap (w=0) means no filtering either
         keep=args.heatmap_keep if heat is not None else 1.0
