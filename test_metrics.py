@@ -3,7 +3,6 @@ import pytest
 from metrics import precision_recall,prompt_accuracy,knn_radii
 from els import patch_schedule_from_fracs,CELEBA_PATCH_FRACS
 from cfdm import sample
-from tree import build_tree,add_node_stats,sample_node
 from textunet import TextUNet,net_sample
 
 
@@ -56,16 +55,6 @@ def test_cfdm_z0_matches_internal_noise():
     z0=torch.randn((4,6),generator=torch.Generator().manual_seed(5),dtype=torch.float64)
     b=sample(4,X,None,steps=20,start_t=0.0,z0=z0)
     assert torch.allclose(a,b)
-
-
-def test_ls_node_sampler():
-    g=torch.Generator().manual_seed(0)
-    T=torch.nn.functional.normalize(torch.randn(40,6,generator=g),dim=-1)
-    X=torch.randn(40,3*8*8,generator=g)
-    tree=add_node_stats(build_tree(T,pca_dim=4,branching="3",c_build=10,n_init=1),X,T)
-    node=tree["children"][0][0]
-    out=sample_node(tree,X,node,3,"ls",g,locality_kwargs={"shape":(3,8,8),"steps":5})
-    assert out.shape==(3,192) and torch.isfinite(out).all()
 
 
 def test_net_sample_unconditional():

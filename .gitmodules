@@ -1,3 +1,9 @@
 [submodule "experiment_helpers"]
 	path = experiment_helpers
 	url = https://github.com/jamesBaker361/experiment_helpers.git
+[submodule "efficient-SID-code"]
+	path = efficient-SID-code
+	url = https://github.com/haojunqiu/efficient-SID-code.git
+[submodule "clip_text_span"]
+	path = clip_text_span
+	url = https://github.com/yossigandelsman/clip_text_span.git

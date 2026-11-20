@@ -63,9 +63,7 @@ def main(args):
     if args.space=="pixel":
         d=3*args.resolution**2
         bytes_per=2 if args.store_dtype=="float16" else 4
-        print(f"pixel bank: {len(dataset)} x {d} = {len(dataset)*d*bytes_per/1e9:.1f}GB; one covariance for the locality sampler = {d*d*4/1e9:.1f}GB")
-        if args.resolution>64:
-            print("warning: pixel space above 64x64 makes the locality/wiener node samplers impractical (d x d covariance)")
+        print(f"pixel bank: {len(dataset)} x {d} = {len(dataset)*d*bytes_per/1e9:.1f}GB")
 
     transform=transforms.Compose([
         transforms.Resize(args.resolution),

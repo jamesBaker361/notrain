@@ -1,9 +1,12 @@
 '''
-sample text-conditioned smoothed CFDM from a bank built by embed.py
+sample text-conditioned closed-form diffusion from a bank built by embed.py
 usage: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompt_file prompts/faces.txt --w 0 1 4
-   or: sbatch runpygpu_chip.sh sample.py --bank banks/celeb_vae_256.pt --prompts "a smiling woman" "a man with a beard" --w 0 1 4
+   or: sbatch runpygpu_chip.sh sample.py --bank banks/celebahq_pix64.pt --method pyramid --heatmap_lambda 1 --w 0 1 4
 each output row is: [top CLIP-retrieved training image | samples...] for one (prompt, w); --unsharp_amount adds the sharpened samples below
---scales 1 2 4 turns on multiscale patches: whole image, quarters and 16ths, blended over time by --schedule
+--method cfdm: smoothed CFDM over the prompt's top-k CLIP matches
+--method pyramid: that CFDM at the coarsest pyramid level, then closed-form patch levels up to full resolution (pyramid.py),
+    with patches optionally weighted (--heatmap_lambda) and filtered (--heatmap_keep, --heatmap_random) by CLIP text heatmaps
+--method net: a trained diffusion model
 '''
 import os
 import re
@@ -15,10 +18,10 @@ import wandb
 import numpy as np
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
-from cfdm import text_log_prior,top_k_subset,sample,sample_multiscale,median_patch_distance
+from cfdm import text_log_prior,top_k_subset,sample,median_distance
+from pyramid import pyramid_sizes,downsample_flat,build_pyramid_banks,sample_pyramid,resize
+from heatmap import token_heatmaps
 from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask
-from tree import tree_sample,node_size,sample_node,subset_tree
-from locality import global_spectrum
 from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,prompt_accuracy
 
 parser=argparse.ArgumentParser()
@@ -27,40 +30,25 @@ parser.add_argument("--prompt_file",type=str,default="prompts/faces.txt",help="o
 parser.add_argument("--prompts",type=str,nargs="+",default=None,help="overrides --prompt_file")
 parser.add_argument("--n_per_prompt",type=int,default=8)
 parser.add_argument("--w",type=float,nargs="+",default=[0.0,1.0,4.0],help="text guidance weights to sweep; 0=unconditional, 1=exact conditional")
-parser.add_argument("--sigma",type=float,default=0.25,help="smoothing, as a fraction of the median pairwise distance between bank points; 0 reproduces training points exactly")
+parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","pyramid","net"],help="cfdm: smoothed CFDM at full resolution; pyramid: CFDM at --coarse_size, then closed-form patch levels; net: a trained diffusion model (--model)")
+parser.add_argument("--sigma",type=float,default=0.25,help="CFDM smoothing, as a fraction of the median pairwise distance between bank points (at the coarsest level for --method pyramid); 0 reproduces training points exactly")
 parser.add_argument("--M",type=int,default=4,help="noise samples per smoothed score evaluation")
-parser.add_argument("--steps",type=int,default=50)
-parser.add_argument("--start_t",type=float,default=0.2,help="start from the exact mixture at this t (0 = pure noise)")
-parser.add_argument("--top_k",type=int,default=1000,help="restrict to the top-k CLIP matches per prompt (<=0 for all); w=0 always uses the full bank")
-parser.add_argument("--scales",type=int,nargs="+",default=[1],help="patch grid sizes, coarse to fine, e.g. 1 2 4 = whole, quarters, 16ths")
-parser.add_argument("--patch_sigma",type=float,default=0.0,help="smoothing at the patch scales (>1), as a fraction of the median patch distance at that scale; --sigma applies to the whole-image scale")
-parser.add_argument("--patch_positions",type=str,default="any",choices=["any","same"],help="whether a region can draw patches from every grid position or only its own")
-parser.add_argument("--schedule",type=str,default="coarse_to_fine",choices=["coarse_to_fine","fine_to_coarse","constant","switch"],help="switch: only the first scale for the first --switch_frac of the trajectory, then only the last (e.g. --scales 1 2: whole image, then quarters)")
-parser.add_argument("--switch_frac",type=float,default=0.5,help="--schedule switch: fraction of [start_t,1] spent at the first scale")
-parser.add_argument("--patch_prior",type=str,default="text",choices=["text","none"],help="patch scales: candidate patches keep their parent image's text prior, or are matched by visual similarity alone")
-parser.add_argument("--scale_weights",type=float,nargs="+",default=None,help="per-scale weights for --schedule constant")
-parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","tree","topk","net"],help="tree: descend a CLIP tree built by tree.py, then sample from the node; topk: no tree, sample from the prompt's --top_k CLIP matches with --node_sampler, each image weighted by softmax(w * log p(image | prompt)) (w=0: the K images unweighted); net: sample a trained diffusion model (--model)")
+parser.add_argument("--steps",type=int,default=50,help="CFDM Euler steps (and the net's sampling steps)")
+parser.add_argument("--start_t",type=float,default=0.2,help="CFDM starts from the exact mixture at this t (0 = pure noise)")
+parser.add_argument("--top_k",type=int,default=1000,help="restrict the CFDM to the top-k CLIP matches per prompt (<=0 for all); w=0 always uses the full bank")
+parser.add_argument("--coarse_size",type=int,default=16,help="pyramid: short side of the coarsest level, where the CFDM runs; levels halve from full resolution down to it")
+parser.add_argument("--patch_size",type=int,default=7,help="pyramid: side of the square patches at every patch level")
+parser.add_argument("--patch_images",type=int,default=50,help="pyramid: images supplying patches, the best CLIP matches (w=0: uniformly random ones); cost grows linearly with it")
+parser.add_argument("--pyramid_steps",type=int,default=10,help="pyramid: denoising steps per patch level")
+parser.add_argument("--fold_rho",type=float,default=0.2,help="pyramid: width of the Gaussian window overlapping patch estimates are averaged with")
+parser.add_argument("--eta",type=float,default=0.0,help="pyramid: patch-level stochasticity in [0,1] (0 = deterministic DDIM)")
+parser.add_argument("--heatmap_lambda",type=float,default=0.0,help="pyramid: logit bonus per standard deviation of a patch's CLIP text-heatmap score (0 = off)")
+parser.add_argument("--heatmap_keep",type=float,default=1.0,help="pyramid: keep this fraction of patches, those with the highest heatmap scores (1 = all)")
+parser.add_argument("--heatmap_random",type=float,default=0.0,help="pyramid: with --heatmap_keep < 1, also keep this random fraction of the other patches")
+parser.add_argument("--heatmap_layers",type=int,default=4,help="pyramid: last attention layers whose direct effects make the heatmap")
+parser.add_argument("--heatmap_baseline",type=str,nargs="+",default=["a photo.","an image.","a picture."],help="pyramid: generic texts whose heatmaps, with the other prompts', are averaged and subtracted")
 parser.add_argument("--model",type=str,default="",help="--method net: 'pretrained:<repo>' (e.g. pretrained:google/ddpm-cifar10-32, as-is), a finetune.py path prefix (cross-attention models use the prompt with w as the CFG scale), or an --unconditional train.py prefix")
 parser.add_argument("--bank_device",type=str,default="auto",choices=["auto","cpu","cuda"],help="where the bank lives; auto keeps banks over 4GB (e.g. 256px pixels) in CPU memory and moves only what's needed")
-parser.add_argument("--tree",type=str,default="",help="tree built by tree.py for this bank")
-parser.add_argument("--tree_depth",type=int,default=5,help="stop the descent at this depth (L)")
-parser.add_argument("--c_search",type=int,default=20,help="stop the descent at the first node with this many images or fewer")
-parser.add_argument("--node_sampler",type=str,default="lowrank",choices=["diagonal","lowrank","cfdm","locality","wiener","ls","curve"],help="how to sample from the stopping node; cfdm uses --sigma, --M, --steps, --start_t; locality/wiener (Lukoianov et al.) use --steps, --tau, --wiener_shrinkage, --wiener_ridge; ls (Kamb & Ganguli) uses --steps, --ls_patch_fracs; curve (a spline through the node's images in TSP order) uses --curve_*, --tsp, --tsp_kicks, --steps")
-parser.add_argument("--curve_mode",type=str,default="random",choices=["random","flow"],help="curve: pick a random point on the curve (text-weighted), or run the ideal-denoiser flow toward the curve")
-parser.add_argument("--curve_max_points",type=int,default=2000,help="curve: nodes with more images fit the curve through a random subset of this many")
-parser.add_argument("--curve_knots",type=int,default=0,help="curve: B-spline basis functions; 0 = one per image (the curve passes through every image), fewer = smoother curves that average neighboring images")
-parser.add_argument("--curve_degree",type=int,default=1,help="curve: spline degree; 1 = polyline through the images (crossfades between path neighbors), 3 = cubic (smoother, but overshoots between dissimilar images)")
-parser.add_argument("--curve_smooth",type=float,default=0.0,help="curve: second-difference penalty relative to the fit term (0 = least squares)")
-parser.add_argument("--curve_grid",type=int,default=0,help="curve: points along the curve that samples are drawn from; 0 = 16 per image within a 2GB budget")
-parser.add_argument("--tsp",type=str,default="auto",choices=["auto","2opt","lkh"],help="curve: image order by chained 2-opt, or LKH (pip install elkai); auto uses LKH if installed")
-parser.add_argument("--tsp_kicks",type=int,default=30,help="curve: double-bridge kicks for chained 2-opt")
-parser.add_argument("--ls_patch_fracs",type=float,nargs="+",default=None,help="ls: patch sizes from noise to data as fractions of the image side; default is the CelebA-64 schedule from Lukoianov et al.")
-parser.add_argument("--tau",type=float,default=0.02,help="locality: Wiener-matrix binarization threshold, relative to each row's max")
-parser.add_argument("--wiener_shrinkage",type=float,default=0.0,help="locality/wiener: blend the node covariance toward the full-bank covariance (0 = node only, 1 = global)")
-parser.add_argument("--wiener_ridge",type=float,default=0.01,help="locality/wiener: add this fraction of the mean pixel variance to the covariance diagonal so small (rank-deficient) nodes still get local masks at low noise")
-parser.add_argument("--wiener_rank",type=int,default=0,help="wiener: if > 0, use rank-k node (and global) covariances with the left-out variance kept as an isotropic term; no d x d matrices, so it runs at any d (e.g. 256px pixels)")
-parser.add_argument("--wiener_exact_eig",action="store_true",help="with --wiener_shrinkage, eigendecompose each node's blended covariance instead of the (equivalent, faster) Woodbury update of the global one")
-parser.add_argument("--node_text_prior",action="store_true",help="locality: also weight node images by w * log p(i|c) inside the softmax")
 parser.add_argument("--fid_samples",type=int,default=0,help="if > 0, generate this many extra samples per w (split across prompts) for FID/KID")
 parser.add_argument("--fid_ref_size",type=int,default=2000,help="reference images for FID/KID: held-out (X_test) and a random training subset")
 parser.add_argument("--kid_subset",type=int,default=100,help="KID subset size (capped at --fid_samples)")
@@ -91,8 +79,9 @@ def main(args):
     X=bank["X"].to(bank_device)
     T=bank["T"].to(device)
     if X.device!=torch.device(device) and args.method=="cfdm":
-        raise ValueError("whole-bank cfdm needs the bank on the GPU; use --method tree or --bank_device cuda")
-    print(f"bank {args.bank}: X {tuple(X.shape)} T {tuple(T.shape)} space {bank['space']} shape {bank['shape']}")
+        raise ValueError("whole-bank cfdm needs the bank on the GPU; use --method pyramid or --bank_device cuda")
+    shape=bank["shape"]
+    print(f"bank {args.bank}: X {tuple(X.shape)} T {tuple(T.shape)} space {bank['space']} shape {shape}")
 
     if args.prompts is not None:
         prompts=args.prompts
@@ -114,37 +103,6 @@ def main(args):
     else:
         eval_model,eval_processor,eval_text_embeds=clip_model,clip_processor,text_embeds
 
-    if args.method=="topk":
-        assert args.top_k>0,"--method topk needs --top_k > 0"
-    if args.method in ["tree","topk"]:
-        if args.method=="tree":
-            assert args.tree,"--method tree needs --tree"
-            tree=torch.load(args.tree,weights_only=False)
-            assert tree["n"]==X.shape[0],f"tree was built for {tree['n']} images but the bank has {X.shape[0]}"
-        eig_cache={}
-        # topk: statistics depend on the prompt and w, so each (prompt, w) gets its own cache
-        topk_caches={}
-        S_global=None
-        spectrum=None
-        global_lowrank=None
-        lowrank_wiener=args.node_sampler=="wiener" and args.wiener_rank>0
-        if lowrank_wiener and args.wiener_shrinkage>0:
-            from locality import low_rank_cov
-            # top components of the whole bank, streamed from wherever the bank lives
-            global_lowrank=low_rank_cov(X,args.wiener_rank,device)
-            print(f"global low-rank covariance: {global_lowrank[2].shape[1]} components, residual variance {global_lowrank[3]:.4g}")
-        if args.node_sampler in ["locality","wiener"] and args.wiener_shrinkage>0 and not lowrank_wiener:
-            # global covariance without materializing a centered copy of the bank
-            assert X.shape[1]<=20000,f"locality/wiener need d x d matrices; d={X.shape[1]} is too large (use pixel <=64px or the vq latents)"
-            Xf=X.to(device).float()
-            mu=Xf.mean(0)
-            S_global=(Xf.T@Xf-Xf.shape[0]*torch.outer(mu,mu))/(Xf.shape[0]-1)
-            del Xf
-            if not args.wiener_exact_eig and args.method=="tree":
-                # Woodbury path: one eigendecomposition for the run instead of one per node
-                spectrum=global_spectrum(S_global)
-                S_global=None
-
     if args.method=="net":
         assert args.model,"--method net needs --model"
         from pretrained import TrainedNet
@@ -153,76 +111,83 @@ def main(args):
         print(f"trained net {args.model}: {'text-conditional (w = CFG scale)' if net.conditional else 'unconditional (prompts and w ignored)'}, starting at t={net.t_min:.4f}")
     lpips_metric=LpipsDiversity(device,args.lpips_net) if args.lpips_net else None
 
-    if args.schedule=="constant":
-        assert args.scale_weights is not None and len(args.scale_weights)==len(args.scales),"--schedule constant needs one --scale_weights per scale"
-
-    # typical distance between bank points (and between patches at each scale) over the whole bank:
-    # sets the smoothing per scale; the scale-1 value also normalizes the copy metric
+    # typical distance between bank points: sets the smoothing and normalizes the copy metric
     generator=torch.Generator(device=device).manual_seed(args.seed)
-    scale=median_patch_distance(X,bank["shape"],1,generator=generator)
-    sigmas=[(args.sigma if s==1 else args.patch_sigma)*median_patch_distance(X,bank["shape"],s,generator=generator) for s in args.scales]
+    scale=median_distance(X,generator=generator)
     sigma=args.sigma*scale
-    print(f"median pairwise distance {scale:.4f}, sigma {sigma:.4f}, per-scale sigmas {dict(zip(args.scales,sigmas))}")
+    if args.method=="pyramid":
+        # the whole bank at the coarsest level, once: the CFDM runs there, and its smoothing is set there
+        sizes=pyramid_sizes(shape[1],shape[2],args.coarse_size)
+        coarse_shape=(shape[0],*sizes[-1])
+        X_coarse=downsample_flat(X,shape,sizes[-1],device)
+        sigma=args.sigma*median_distance(X_coarse,generator=generator)
+        print(f"pyramid levels {sizes} (CFDM at {sizes[-1]}, {args.patch_size}x{args.patch_size} patches above)")
+        heatmap_on=args.heatmap_lambda!=0 or args.heatmap_keep<1
+        if heatmap_on:
+            # every prompt's heatmaps, minus their mean over all prompts and the generic baseline texts
+            heat_texts=torch.cat([text_embeds,encode_texts_clip(clip_model,clip_processor,args.heatmap_baseline,device)])
+        pyramid_banks={}
+    print(f"median pairwise distance {scale:.4f}, sigma {sigma:.4f}")
 
     os.makedirs(args.output_dir,exist_ok=True)
     # best CLIP matches per prompt (for the retrieved image shown in each row); the subset itself is only built when used
-    top_idx={p:torch.topk(log_priors[p],min(max(args.top_k,1),X.shape[0])).indices for p in range(len(prompts))}
+    top_idx={p:torch.topk(log_priors[p],min(max(args.top_k,args.patch_images if args.method=="pyramid" else 1,1),X.shape[0])).indices for p in range(len(prompts))}
+
+    def patch_banks(p:int,w:float):
+        '''
+        the pyramid's patch banks for prompt p at weight w, built once and reused (e.g. across FID batches)
+        '''
+        if (p,w) in pyramid_banks:
+            return pyramid_banks[(p,w)]
+        if w==0:
+            # unconditional: random images, no text prior or heatmap (the CLIP matches would themselves be conditioning)
+            idx=torch.randperm(X.shape[0],generator=torch.Generator().manual_seed(args.seed+p))[:args.patch_images]
+            prior,heat=None,None
+        else:
+            idx=top_idx[p][:args.patch_images].cpu()
+            prior=log_priors[p][idx.to(device)]
+            heat=None
+            if heatmap_on:
+                images=to_pil(bank_to_pixels(bank,X[idx.to(X.device)],vae))
+                maps=token_heatmaps(clip_model,clip_processor,images,heat_texts,device,args.heatmap_layers)
+                heat=resize((maps[:,p]-maps.mean(1))[:,None],shape[1:])
+        images=X[idx.to(X.device)].to(device).float().reshape(-1,*shape)
+        # no heatmap (w=0) means no filtering either
+        keep=args.heatmap_keep if heat is not None else 1.0
+        banks=build_pyramid_banks(images,args.coarse_size,args.patch_size,prior,w,heat,args.heatmap_lambda,
+                                  keep,args.heatmap_random,generator)
+        info={"patches_per_level":[b["patches"].shape[0] for b in banks],
+              "patches_kept":sum(b["patches"].shape[0] for b in banks)/sum(b["n_total"] for b in banks)}
+        print(f"prompt {p} w={w}: patch banks {info}")
+        pyramid_banks[(p,w)]=(banks,info)
+        return banks,info
 
     def generate(p:int,w:float,n:int):
         '''
-        n samples for prompt p at weight w; returns (samples, tree nodes or None, prior_mass or None)
+        n samples for prompt p at weight w; returns (samples, prior_mass or None, extra metrics)
         '''
         if args.method=="net":
-            z0=torch.randn((n,*bank["shape"]),generator=generator,device=device)
-            return net.sample(z0,args.steps,net.t_min,prompts[p],w).flatten(1),None,None
-        if args.method in ["tree","topk"]:
-            cfdm_kwargs={"log_prior":log_priors[p],"w":w,"sigma":sigma,"M":args.M,"steps":args.steps,"start_t":args.start_t}
-            if args.scales!=[1]:
-                cfdm_kwargs["multiscale"]={"shape":bank["shape"],"scales":args.scales,"sigmas":sigmas,"schedule":args.schedule,
-                                           "constant_weights":args.scale_weights,"positions":args.patch_positions,
-                                           "patch_prior":args.patch_prior,"switch_frac":args.switch_frac}
-            locality_kwargs={"tau":args.tau,"steps":args.steps,"shrinkage":args.wiener_shrinkage,"ridge":args.wiener_ridge,
-                             "S_global":S_global,"spectrum":spectrum,"cache":eig_cache,
-                             "shape":bank["shape"],"ls_patch_fracs":args.ls_patch_fracs,
-                             "wiener_rank":args.wiener_rank,"global_lowrank":global_lowrank,
-                             "log_prior":log_priors[p] if args.node_text_prior else None,"w":w,
-                             "curve":{"max_points":args.curve_max_points,"n_knots":args.curve_knots,"degree":args.curve_degree,"smooth":args.curve_smooth,
-                                      "grid":args.curve_grid,"mode":args.curve_mode,"tsp":args.tsp,"kicks":args.tsp_kicks,
-                                      "steps":args.steps,"log_prior":log_priors[p],"w":w}}
-        if args.method=="tree":
-            # w sets the descent sharpness (0 = uniform random walk), so no top-k subset is used
-            out,nodes=tree_sample(tree,X,text_embeds[p],n,w,bank["logit_scale"],args.tree_depth,
-                                  args.c_search,args.node_sampler,generator,cfdm_kwargs=cfdm_kwargs,
-                                  locality_kwargs=locality_kwargs,device=device)
-            return out,nodes,None
-        if args.method=="topk":
-            # the prompt's top-K CLIP matches as one node; wiener/locality statistics weighted by softmax(w * log prior)
-            # (cfdm and curve weight by the same prior themselves); w=0 keeps the K images unweighted
-            idx=top_idx[p]
-            weights=torch.softmax(w*log_priors[p][idx].float(),dim=-1)
-            locality_kwargs["weights"]=weights
-            locality_kwargs["cache"]=topk_caches.setdefault((p,w),{})
-            out=sample_node(subset_tree(idx),X,0,n,args.node_sampler,generator,cfdm_kwargs,locality_kwargs,device)
-            prior_mass=torch.softmax(w*log_priors[p],dim=-1)[idx].sum().item()
-            return out,None,prior_mass
-        X_sub,log_prior,idx=top_k_subset(X,log_priors[p],args.top_k)
+            z0=torch.randn((n,*shape),generator=generator,device=device)
+            return net.sample(z0,args.steps,net.t_min,prompts[p],w).flatten(1),None,{}
         if w==0:
             # unconditional baseline: the top-k subset would itself be text conditioning
-            X_w,log_prior_w,prior_mass=X,None,1.0
+            sub,log_prior,prior_mass=None,None,1.0
         else:
+            _,log_prior,sub=top_k_subset(T,log_priors[p],args.top_k)
             # fraction of the w-sharpened prior that the top-k subset keeps
-            X_w,log_prior_w=X_sub,log_prior
-            prior_mass=torch.softmax(w*log_priors[p],dim=-1)[idx].sum().item()
+            prior_mass=torch.softmax(w*log_priors[p],dim=-1)[sub].sum().item()
             if prior_mass<0.9:
                 print(f"warning: top_k={args.top_k} keeps only {prior_mass:.3f} of the prior mass for '{prompts[p]}' at w={w}")
-        if args.scales==[1]:
-            out=sample(n,X_w,log_prior_w,w=w,sigma=sigma,M=args.M,steps=args.steps,start_t=args.start_t,generator=generator)
-        else:
-            out=sample_multiscale(n,X_w,bank["shape"],args.scales,log_prior_w,w=w,sigmas=sigmas,M=args.M,
-                                  steps=args.steps,start_t=args.start_t,schedule=args.schedule,
-                                  constant_weights=args.scale_weights,positions=args.patch_positions,patch_prior=args.patch_prior,
-                                  switch_frac=args.switch_frac,generator=generator)
-        return out,None,prior_mass
+        if args.method=="cfdm":
+            X_w=X if sub is None else X[sub]
+            out=sample(n,X_w,log_prior,w=w,sigma=sigma,M=args.M,steps=args.steps,start_t=args.start_t,generator=generator)
+            return out,prior_mass,{}
+        banks,info=patch_banks(p,w)
+        coarse=X_coarse if sub is None else X_coarse[sub]
+        out=sample_pyramid(n,coarse,shape,banks,args.coarse_size,args.patch_size,log_prior,w=w,sigma=sigma,M=args.M,
+                           cfdm_steps=args.steps,start_t=args.start_t,steps=args.pyramid_steps,rho=args.fold_rho,
+                           eta=args.eta,generator=generator)
+        return out,prior_mass,info
 
     def nearest_train(out:torch.Tensor)->torch.Tensor:
         # distance to the closest training point, relative to the typical pairwise distance; streams the bank
@@ -240,7 +205,7 @@ def main(args):
         rows=[]
         for w in args.w:
             start=time.time()
-            out,nodes,prior_mass=generate(p,w,args.n_per_prompt)
+            out,prior_mass,info=generate(p,w,args.n_per_prompt)
             if device=="cuda":
                 torch.cuda.synchronize()
             elapsed=time.time()-start
@@ -262,11 +227,10 @@ def main(args):
                 # perceptual version of the same, and whether an independent CLIP picks this prompt among all prompts
                 "lpips_diversity":lpips_metric.mean_pairwise(pixels) if lpips_metric else None,
                 "prompt_accuracy":prompt_accuracy(image_embeds,eval_text_embeds,torch.full((out.shape[0],),p)),
-                "seconds_per_sample":elapsed/args.n_per_prompt
+                # the first call includes building the pyramid's patch banks
+                "seconds_per_sample":elapsed/args.n_per_prompt,
+                **info
             }
-            if nodes is not None:
-                metrics["node_size"]=float(np.mean([node_size(tree,m) for m in nodes]))
-                metrics["distinct_nodes"]=len(set(nodes))
             print(metrics)
             results.append(metrics)
             row=concat_images_horizontally([retrieved]+images)
@@ -276,7 +240,7 @@ def main(args):
                 row=concat_images_vertically([row,concat_images_horizontally([retrieved]+sharpened)])
             rows.append(row)
             if not args.no_wandb:
-                wandb.log({f"{name}/w={w}":wandb.Image(row),**{f"{name}/{k}":v for k,v in metrics.items() if k!="prompt"}})
+                wandb.log({f"{name}/w={w}":wandb.Image(row),**{f"{name}/{k}":v for k,v in metrics.items() if k!="prompt" and not isinstance(v,list)}})
         grid=concat_images_vertically(rows)
         grid.save(os.path.join(args.output_dir,f"{p}_{name}.png"))
 

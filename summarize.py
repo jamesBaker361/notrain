@@ -1,6 +1,6 @@
 '''
 collect sample.py runs into one comparison: a table of metrics averaged over prompts for each
-(node sampler, tree depth, w), and per (prompt, w) an image stacking every run's samples with a label
+(run, w), and per (prompt, w) an image stacking every run's samples with a label
 usage: python summarize.py --runs 'outputs/pix_celeb_*' --output_dir outputs/summary_pix_celeb
 '''
 import os
@@ -18,7 +18,7 @@ parser.add_argument("--output_dir",type=str,default="outputs/summary")
 parser.add_argument("--label_width",type=int,default=150)
 
 # per-prompt metrics are averaged over prompts; fid_*/kid_* come from sample.py's --fid_samples pass ("__all__" rows)
-METRICS=["clip_score","prompt_accuracy","copy_rate","nn_dist","diversity","lpips_diversity","node_size","distinct_nodes","seconds_per_sample",
+METRICS=["clip_score","prompt_accuracy","copy_rate","nn_dist","diversity","lpips_diversity","patches_kept","seconds_per_sample",
          "fid_test","kid_test","precision_test","recall_test","fid_train","kid_train","precision_train","recall_train",
          "fid_copy_rate","fid_nn_dist","dino_nn_sim","dino_copy_rate","fid_prompt_accuracy","fid_lpips_diversity","fid_seconds_per_sample"]
 
@@ -30,18 +30,17 @@ def run_label(args:dict)->str:
             return f"net {model.split(':',1)[1].split('/')[-1]} (as-is)"
         # finetune.py runs live in weights/<name>/ema
         return f"net {os.path.basename(os.path.dirname(model)) or model}"
-    if args.get("method")=="tree":
-        # trees other than the default k-means one are named <bank>_tree_<method>.pt
-        tree_name=os.path.basename(args.get("tree") or "")
-        cluster=f" [{tree_name.split('_tree_')[1][:-3]}]" if "_tree_" in tree_name else ""
-        if args["tree_depth"]>=99:
-            return "retrieval (leaf)"+cluster
-        return f"{args['node_sampler']} L{args['tree_depth']}"+(" (no tree)" if args["tree_depth"]==0 else "")+cluster
-    if args.get("method")=="topk":
-        scales=args.get("scales") or [1]
-        multiscale="" if scales==[1] or args["node_sampler"]!="cfdm" else f" scales{scales} {args.get('schedule')}"+(" visual patches" if args.get("patch_prior")=="none" else "")
-        return f"{args['node_sampler']}{multiscale} K{args['top_k']} (no tree)"
-    return f"{args.get('method','cfdm')} scales{args.get('scales')}"
+    if args.get("method")=="pyramid":
+        label=f"pyramid c{args['coarse_size']} p{args['patch_size']}"
+        if args.get("heatmap_keep",1.0)<1:
+            label+=f" keep{args['heatmap_keep']}"+(f"+rand{args['heatmap_random']}" if args.get("heatmap_random") else "")
+        if args.get("heatmap_lambda"):
+            label+=f" hm{args['heatmap_lambda']}"
+        return label
+    if args.get("method","cfdm")=="cfdm":
+        return f"cfdm K{args['top_k']}"
+    # runs from removed samplers (CLIP tree, top-K node samplers) are still listed, by method and run dir
+    return f"{args['method']} [{os.path.basename(os.path.normpath(args.get('output_dir','')))}]"
 
 
 def main(args):
@@ -57,8 +56,8 @@ def main(args):
     for r in runs:
         if labels.count(r["label"])>1:
             r["label"]+=f" [{os.path.basename(os.path.normpath(r['dir']))}]"
-    # order rows by sampler, then depth
-    runs.sort(key=lambda r:(r["args"].get("node_sampler",""),r["args"].get("tree_depth",0),r["dir"]))
+    # order rows by method, then label
+    runs.sort(key=lambda r:(r["args"].get("method","cfdm"),r["label"],r["dir"]))
     os.makedirs(args.output_dir,exist_ok=True)
 
     table=[]

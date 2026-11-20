@@ -66,7 +66,7 @@ class TextUNet(nn.Module):
 def net_sample(model:TextUNet,z0:torch.Tensor,steps:int=10,t_min:float=1e-3,text:torch.Tensor=None,text_mask:torch.Tensor=None)->torch.Tensor:
     '''
     Euler on the learned velocity from z0 (noise at t_min) to t = 1, on the same time grid as the closed-form
-    samplers (locality.py, els.py), so analytical and trained samples from the same z0 are comparable.
+    samplers (cfdm.py, els.py), so analytical and trained samples from the same z0 are comparable.
     text: (B,text_dim); defaults to zeros for an --unconditional model
     '''
     B=z0.shape[0]

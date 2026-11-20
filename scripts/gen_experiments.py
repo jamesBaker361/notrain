@@ -1,4 +1,5 @@
-# CLIP-tree closed-form samplers vs trained diffusion models, on standard datasets:
+# closed-form samplers (whole-image CFDM, and the CFDM -> patch pyramid of pyramid.py) vs trained diffusion models,
+# on standard datasets:
 #   cifar10_pix32    uoft-cs/cifar10 (test split held out), pixels 32x32,   nets from google/ddpm-cifar10-32
 #   celebahq_pix256  korexyz/celeba-hq-256x256 (validation held out), pixels 256x256, nets from google/ddpm-celebahq-256
 #   celebahq_ldm     same data in the VQ latents (3x64x64) of CompVis/ldm-celebahq-256, nets from that LDM
@@ -18,13 +19,12 @@
 #   class-sorted; 30k bank + 2k held out) rather than its 20GB train split
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
-# usage: python scripts/gen_experiments.py build|tree|train|sample_tree|sample_topk|sample_nets|agreement|summarize [setting ...]
-# (tree = only the tree jobs, for banks that already exist, e.g. after adding to cluster_methods)
-# (sample = sample_tree + sample_topk + sample_nets); sample_tree and sample_topk only need build, sample_nets and agreement need train
-# sample_topk: no tree, each sampler on the prompt's top-K CLIP matches (K in topk_values), weighted by the text prior
-# make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tree slurm_chip/train slurm_chip/sample slurm_chip/agreement
+# usage: python scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement|summarize [setting ...]
+# (sample = sample_closed + sample_nets); sample_closed only needs build, sample_nets and agreement need train
+# sample_closed: the whole-image CFDM on the prompt's top-K CLIP matches, and each pyramid variant (pyramid_variants)
+# make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/train slurm_chip/sample slurm_chip/agreement
 # FID/KID need torch-fidelity in the cluster env: pip install torch-fidelity
-# SHARPEN=1 python scripts/gen_experiments.py sample_topk ...: the sample runs again into outputs/<run>_sharp with
+# SHARPEN=1 python scripts/gen_experiments.py sample_closed ...: the sample runs again into outputs/<run>_sharp with
 # before/after-unsharp-mask grids (radius 1 px up to 64px output, 2 px above); metrics are the same as the plain runs
 import os
 import re
@@ -44,8 +44,8 @@ SETTINGS={
         "base":"google/ddpm-cifar10-32",
         "prompts":"prompts/cifar10.txt",
         "train":"--batch_size 128 --max_steps 50000",
-        "methods":["cfdm","locality","wiener","ls"],
-        "depths":[0,2,4,8,99],
+        # 8 -> 16 -> 32: CFDM at 8x8, 5x5 patches at 16 and 32
+        "pyramid":"--coarse_size 8 --patch_size 5",
     },
     "celebahq_pix256":{
         # 28000 x 196608 pixels: stored in float16 (11GB) and kept in CPU memory by sample.py/agreement.py
@@ -54,10 +54,10 @@ SETTINGS={
         "base":"google/ddpm-celebahq-256",
         "prompts":"prompts/celeb.txt",
         "train":"--batch_size 8 --gradient_checkpointing --max_steps 50000",
-        # locality needs d x d matrices (d = 196608), so wiener runs low-rank; depth 0 would need the whole bank on the GPU
-        "methods":["cfdm","wiener","ls"],
-        "depths":[2,4,8,99],
-        "extra":{"wiener":"--wiener_rank 512"},
+        # whole-bank cfdm would need the 11GB bank on the GPU; the pyramid only moves its patch images there, and
+        # fewer of them, since every 256px image gives 62k patches
+        "cfdm":False,
+        "pyramid":"--coarse_size 16 --patch_size 7 --patch_images 10",
     },
     "celebahq_ldm":{
         "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space vq --vae CompVis/ldm-celebahq-256 --resolution 256",
@@ -67,8 +67,6 @@ SETTINGS={
         "train":"--batch_size 16 --gradient_checkpointing --max_steps 50000",
         # the LDM UNet (274M parameters) trains on the bigger GPU nodes
         "train_script":"runpygpu_chip_heavy.sh",
-        "methods":["cfdm","locality","wiener","ls"],
-        "depths":[0,2,4,8,99],
     },
     "celebahq_pix64":{
         "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space pixel --resolution 64",
@@ -77,8 +75,6 @@ SETTINGS={
         "sample_size":64,
         "prompts":"prompts/celeb.txt",
         "train":"--batch_size 64 --max_steps 100000",
-        "methods":["cfdm","locality","wiener","ls"],
-        "depths":[0,2,4,8,99],
         # the 256px checkpoint as-is doesn't apply to 64px inputs
         "nets":["ft","scratch"],
     },
@@ -90,8 +86,6 @@ SETTINGS={
         "sample_size":64,
         "prompts":"prompts/imagenet.txt",
         "train":"--batch_size 64 --max_steps 100000",
-        "methods":["cfdm","locality","wiener","ls"],
-        "depths":[0,2,4,8,99],
         "nets":["scratch"],
     },
     "wikiart_pix64":{
@@ -103,8 +97,6 @@ SETTINGS={
         "sample_size":64,
         "prompts":"prompts/wikiart.txt",
         "train":"--batch_size 64 --max_steps 100000",
-        "methods":["cfdm","locality","wiener","ls"],
-        "depths":[0,2,4,8,99],
         "nets":["scratch"],
     },
     "league_pix64":{
@@ -117,8 +109,6 @@ SETTINGS={
         "prompts":"prompts/league-splash-tagged.txt",
         # only 1800 training images
         "train":"--batch_size 64 --max_steps 20000",
-        "methods":["cfdm","locality","wiener","ls"],
-        "depths":[0,2,4,8,99],
         "nets":["scratch"],
     },
 }
@@ -131,6 +121,7 @@ for data,flags,caption,steps in [
 ]:
     for space,template,embed_flags,net_flags in [
         ("pix256","celebahq_pix256","--space pixel --resolution 256 --store_dtype float16 --batch_size 16",{}),
+        # 4x32x32 latents: CFDM at 8x8, 5x5 patches at 16 and 32, as for CIFAR-10's pixels
         ("ldm","celebahq_ldm","--space vae --vae stabilityai/sd-vae-ft-mse --resolution 256",{"sample_size":32,"channels":4}),
     ]:
         base=SETTINGS[template]
@@ -142,45 +133,25 @@ for data,flags,caption,steps in [
             "train":base["train"].replace("--max_steps 50000",f"--max_steps {steps}"),
             "nets":["scratch"],
             **net_flags,
+            **({"pyramid":"--coarse_size 8 --patch_size 5"} if space=="ldm" else {}),
         }
-# every setting also runs the curve sampler (a polyline through the node's images in TSP order, sampled along)
-for cfg in SETTINGS.values():
-    cfg["methods"]=cfg["methods"]+["curve"]
 settings=sys.argv[2:] or list(SETTINGS)
-STAGES=["build","tree","train","sample","sample_tree","sample_topk","sample_nets","agreement","summarize","all"]
+STAGES=["build","train","sample","sample_closed","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
     sys.exit(f"usage: python scripts/gen_experiments.py <stage> [setting ...]\n  stages: {' '.join(STAGES)}\n  settings: {' '.join(SETTINGS)}\n  got stage={stage!r} settings={settings}")
 
-# top-K set sizes for sample_topk (the tree-free alternative to the depth cutoff)
-topk_values=[50,200,1000]
-# extra top-K cfdm runs: whole image for the first half of sampling, then one (s2 = quarters) or two (s4 = 16ths)
-# scales finer, with the patches matched by visual similarity (no text prior below the whole-image scale)
-topk_cfdm_variants={
-    "cfdm_s2":"--scales 1 2 --schedule switch --switch_frac 0.5 --patch_prior none --project_name notrain_scale",
-    "cfdm_s4":"--scales 1 4 --schedule switch --switch_frac 0.5 --patch_prior none --project_name notrain_scale",
-}
-# trees to build and sample; kmeans keeps the original file/run names, others get a _<name> suffix
-# *_caption trees cluster the CLIP text embeddings of the captions instead of the images, *_mix a 50/50 blend;
-# CIFAR-10's captions are one template per class, so caption trees there are only 10 real clusters (use mix)
-cluster_methods=["dbscan","agglomerative"]
-cluster_flags={
-    "kmeans":"--cluster_method kmeans --branching silhouette",
-    "dbscan":"--cluster_method dbscan --dbscan_min_samples 5 --dbscan_quantile 0.5",
-    "agglomerative":"--cluster_method agglomerative --linkage ward",
-}
-for m in list(cluster_flags):
-    cluster_flags[f"{m}_caption"]=cluster_flags[m]+" --cluster_on caption"
-    cluster_flags[f"{m}_mix"]=cluster_flags[m]+" --cluster_on mix --caption_weight 0.5"
-# --c_search 1 so the descent only stops at the depth cutoff (or at a leaf); depth 0 = no tree (the paper's setting),
-# depth 99 = always a single-image leaf, i.e. a CLIP-guided retrieval baseline
-# CLIP score uses a different CLIP than the one conditioning the descent (the bank's ViT-L/14)
+# CLIP score uses a different CLIP than the one conditioning the samplers (the bank's ViT-L/14)
 metrics="--n_per_prompt 4 --fid_samples 500 --kid_subset 100 --fid_ref_size 2000 --eval_clip_model openai/clip-vit-base-patch16"
-method_flags={
-    "cfdm":"--node_sampler cfdm --steps 50 --sigma 0.25 --start_t 0.2",
-    "locality":"--node_sampler locality --steps 10 --tau 0.02 --wiener_shrinkage 0.5 --wiener_ridge 0",
-    "wiener":"--node_sampler wiener --steps 10 --wiener_shrinkage 0.5 --wiener_ridge 0",
-    "ls":"--node_sampler ls --steps 10",
-    "curve":"--node_sampler curve --curve_mode random",
+# the CFDM (whole image, or the pyramid's coarsest level) runs over the prompt's top-1000 CLIP matches
+cfdm_flags="--top_k 1000 --steps 50 --sigma 0.25 --start_t 0.2"
+# pyramid runs: no heatmap; heatmap bonus only; hard filter to the top quarter (expected to tile the prompt's
+# regions everywhere); top quarter plus a random quarter of the rest; and that filter plus the bonus
+pyramid_variants={
+    "pyramid":"",
+    "pyramid_hm":"--heatmap_lambda 1",
+    "pyramid_strict":"--heatmap_keep 0.25",
+    "pyramid_keep":"--heatmap_keep 0.25 --heatmap_random 0.25",
+    "pyramid_keep_hm":"--heatmap_keep 0.25 --heatmap_random 0.25 --heatmap_lambda 1",
 }
 # fine-tuning starts from the checkpoint (lower lr); scratch training from random init
 train_flags={"ft":"--init pretrained --cross_attention --lr 2e-5","scratch":"--init scratch --cross_attention --lr 1e-4"}
@@ -214,8 +185,6 @@ def sbatch(job:str,log:str,cmd:str,dependency:str="",script:str="runpygpu_chip.s
 for name in settings:
     cfg=SETTINGS[name]
     bank=f"banks/{name}.pt"
-    trees={m:(f"banks/{name}_tree.pt" if m=="kmeans" else f"banks/{name}_tree_{m}.pt") for m in cluster_methods}
-    tree_jobs=[(f"tree_{name}_{m}",f"tree/{name}_{m}",f"tree.py --bank {bank} --save_path {path} {cluster_flags[m]}") for m,path in trees.items()]
     nets={"pretrained":f"pretrained:{cfg['base']}","ft":f"weights/{name}_ft/ema","scratch":f"weights/{name}_scratch/ema"}
     nets={k:v for k,v in nets.items() if k in cfg.get("nets",nets)}
     size=f"--sample_size {cfg['sample_size']}" if cfg.get("sample_size") else ""
@@ -226,9 +195,9 @@ for name in settings:
     if cfg.get("channels"):
         size+=f" --channels {cfg['channels']}"
     if stage in ["build","all"]:
-        # embed -> (BLIP captions) -> tree, each waiting for the previous job; steps whose output is already on
-        # disk are skipped (an existing bank isn't re-embedded, a captioned one isn't re-captioned, existing trees
-        # are kept unless the bank is rebuilt), so re-running build only submits what's missing
+        # embed -> (BLIP captions), the captions waiting for the bank; steps whose output is already on disk are
+        # skipped (an existing bank isn't re-embedded, a captioned one isn't re-captioned), so re-running build
+        # only submits what's missing
         # (jobs still queued or running aren't detected: don't re-run build until they're done)
         need_embed=not os.path.exists(bank)
         captioned=False if need_embed else has_captions(bank)
@@ -239,60 +208,32 @@ for name in settings:
             jobs.append(("embed_"+name,"embed/"+name,f"embed.py {cfg['embed']} --save_path {bank}"))
         if cfg["blip"] and captioned is False:
             jobs.append(("caption_"+name,"caption/"+name,f"caption.py --bank {bank} {cfg.get('caption','')}"))
-        if captioned is not None:
-            jobs+=[job for job,path in zip(tree_jobs,trees.values()) if need_embed or not os.path.exists(path)]
-            if not jobs:
-                print(f"# {name}: bank, captions and trees already built",file=sys.stderr)
-        # the trees only wait for the bank steps (embed/caption), not for each other
+        if captioned is not None and not jobs:
+            print(f"# {name}: bank and captions already built",file=sys.stderr)
         parts=[]
         dep=""
         for job,log,cmd in jobs:
-            if job.startswith("tree_"):
-                parts.append(sbatch(job,log,cmd,dep))
-            else:
-                parts.append(f"jid=$({sbatch(job,log,cmd,dep)})")
-                dep="$jid"
+            parts.append(f"jid=$({sbatch(job,log,cmd,dep)})")
+            dep="$jid"
         if parts:
             print(" && ".join(parts))
-    if stage=="tree":
-        # trees only, for a bank that already exists (e.g. adding a clustering method)
-        for job,log,cmd in tree_jobs:
-            print(sbatch(job,log,cmd))
     if stage in ["train","all"]:
         for kind,flags in train_flags.items():
             if kind not in nets:
                 continue
             print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {size} {cfg['train']}",
                          script=cfg.get("train_script","runpygpu_chip.sh")))
-    if stage in ["sample","sample_tree","all"]:
-        for cm,tree in trees.items():
-            suffix="" if cm=="kmeans" else f"_{cm}"
-            for depth in cfg["depths"]:
-                if depth==0 and cm!=cluster_methods[0]:
-                    # depth 0 is the whole bank whatever the tree, so it only runs once
-                    continue
-                for method in cfg["methods"]:
-                    if depth==99 and method!="cfdm":
-                        # every sampler returns the leaf's image, so one retrieval run is enough
-                        continue
-                    run=(f"{name}_{method}_L{depth}{suffix}" if depth!=99 else f"{name}_retrieval{suffix}")+sharp_suffix
-                    if finished(f"outputs/{run}"):
-                        continue
-                    extra=cfg.get("extra",{}).get(method,"")
-                    print(sbatch(f"{method}_L{depth}{suffix}",f"sample/{run}",f"sample.py --bank {bank} --tree {tree} --prompt_file {cfg['prompts']} --method tree --c_search 1 --w 0 1 4 {metrics} --tree_depth {depth} {method_flags[method]} {extra} {sharp_flags} --output_dir outputs/{run}"))
-    if stage in ["sample","sample_topk","all"]:
-        for k in topk_values:
-            for method in cfg["methods"]:
-                run=f"{name}_{method}_K{k}{sharp_suffix}"
-                if finished(f"outputs/{run}"):
-                    continue
-                extra=cfg.get("extra",{}).get(method,"")
-                print(sbatch(f"{method}_K{k}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method topk --top_k {k} --w 0 1 4 {metrics} {method_flags[method]} {extra} {sharp_flags} --output_dir outputs/{run}"))
-            for variant,flags in topk_cfdm_variants.items():
-                run=f"{name}_{variant}_K{k}{sharp_suffix}"
-                if finished(f"outputs/{run}"):
-                    continue
-                print(sbatch(f"{variant}_K{k}",f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --method topk --top_k {k} --w 0 1 4 {metrics} {method_flags['cfdm']} {flags} {sharp_flags} --output_dir outputs/{run}"))
+    if stage in ["sample","sample_closed","all"]:
+        runs={}
+        if cfg.get("cfdm",True):
+            runs["cfdm"]=f"--method cfdm {cfdm_flags}"
+        for variant,flags in pyramid_variants.items():
+            runs[variant]=f"--method pyramid {cfdm_flags} --pyramid_steps 10 {cfg.get('pyramid','')} {flags}"
+        for label,flags in runs.items():
+            run=f"{name}_{label}{sharp_suffix}"
+            if finished(f"outputs/{run}"):
+                continue
+            print(sbatch(label,f"sample/{run}",f"sample.py --bank {bank} --prompt_file {cfg['prompts']} --w 0 1 4 {metrics} {flags} {sharp_flags} --output_dir outputs/{run}"))
     if stage in ["sample","sample_nets","all"]:
         for kind,spec in nets.items():
             # the as-is checkpoint is unconditional, so only w=0 means anything; the cross-attention nets use w as the CFG scale
@@ -304,6 +245,6 @@ for name in settings:
     if stage in ["agreement","all"] and not finished(f"outputs/agreement_{name}","agreement.json"):
         # target: the net trained from scratch on exactly our bank; the checkpoint and its fine-tune as "another DDPM"
         others=" ".join(v for k,v in nets.items() if k!="scratch")
-        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {others} --methods {' '.join(['ideal']+[m for m in cfg['methods'] if m!='curve'])} {cfg.get('extra',{}).get('wiener','')} --n 64 --output_dir outputs/agreement_{name}"))
+        print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {others} --methods ideal cfdm ls --n 64 --output_dir outputs/agreement_{name}"))
     if stage in ["summarize","all"]:
         print(f"python summarize.py --runs 'outputs/{name}_*' --output_dir outputs/summary_{name}")
