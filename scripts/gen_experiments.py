@@ -17,6 +17,9 @@
 #   set up like celebahq_pix256 / celebahq_ldm with scratch nets only (the ldm-celebahq-256 UNet with 4 channels at
 #   32x32). ImageNet at 256 comes from benjamin-paine/imagenet-1k-256x256's validation split (0.7GB, not
 #   class-sorted; 30k bank + 2k held out) rather than its 20GB train split
+#   {celebahq,imagenet,wikiart,league}_flux2: the same 256px images in the normalized 32x32x32 latents of the FLUX.2
+#   autoencoder (black-forest-labs/FLUX.2-dev, gated: accept its license and log in on the cluster), set up like
+#   the _ldm settings with a scratch net (the ldm-celebahq-256 UNet with 32 channels at 32x32)
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
 # usage: python scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement|summarize [setting ...]
@@ -123,6 +126,8 @@ for data,flags,caption,steps in [
         ("pix256","celebahq_pix256","--space pixel --resolution 256 --store_dtype float16 --batch_size 16",{}),
         # 4x32x32 latents: CFDM at 8x8, 5x5 patches at 16 and 32, as for CIFAR-10's pixels
         ("ldm","celebahq_ldm","--space vae --vae stabilityai/sd-vae-ft-mse --resolution 256",{"sample_size":32,"channels":4}),
+        # 32x32x32 FLUX.2 latents (bf16: the VAE upcasts in fp16), same pyramid geometry
+        ("flux2","celebahq_ldm","--space flux2 --resolution 256 --mixed_precision bf16",{"sample_size":32,"channels":32}),
     ]:
         base=SETTINGS[template]
         SETTINGS[f"{data}_{space}"]={
@@ -133,8 +138,16 @@ for data,flags,caption,steps in [
             "train":base["train"].replace("--max_steps 50000",f"--max_steps {steps}"),
             "nets":["scratch"],
             **net_flags,
-            **({"pyramid":"--coarse_size 8 --patch_size 5"} if space=="ldm" else {}),
+            **({"pyramid":"--coarse_size 8 --patch_size 5"} if space in ["ldm","flux2"] else {}),
         }
+# CelebA-HQ in FLUX.2 latents: like the other _flux2 settings, on the faces of celebahq_ldm
+SETTINGS["celebahq_flux2"]={
+    **SETTINGS["wikiart_flux2"],
+    "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space flux2 --resolution 256 --mixed_precision bf16",
+    "caption":"",
+    "prompts":"prompts/celeb.txt",
+    "train":SETTINGS["celebahq_ldm"]["train"],
+}
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","train","sample","sample_closed","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):

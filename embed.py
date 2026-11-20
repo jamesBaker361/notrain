@@ -1,10 +1,11 @@
 '''
-build the bank for text-conditioned CFDM / the CLIP tree:
-    X: (N,D) flattened training points: pixels in [-1,1] (--space pixel), SD-VAE latents (--space vae), or the
-       VQ latents of a latent-diffusion repo such as CompVis/ldm-celebahq-256 (--space vq)
+build the bank for text-conditioned CFDM and the pyramid sampler:
+    X: (N,D) flattened training points: pixels in [-1,1] (--space pixel), SD-VAE latents (--space vae), the
+       VQ latents of a latent-diffusion repo such as CompVis/ldm-celebahq-256 (--space vq), or the normalized
+       32x(H/8)x(W/8) latents of the FLUX.2 autoencoder (--space flux2; sides divisible by 16)
     T: (N,E) L2-normalized CLIP image embeddings of the same images
     X_test/T_test: held-out images, from a separate split (--test_split) or the last --holdout training rows;
-       never in the tree or the samplers, only the FID/KID reference
+       never in the samplers, only the FID/KID reference
     captions/C (+ captions_test): with --label_column, captions from class names via --caption_template and
        their CLIP text embeddings (otherwise run caption.py for BLIP captions)
 usage: sbatch runpygpu_chip.sh embed.py --dataset uoft-cs/cifar10 --image_column img --test_split test --label_column label --space pixel --resolution 32
@@ -32,8 +33,8 @@ parser.add_argument("--metadata_columns",type=str,nargs="*",default=[],help="col
 parser.add_argument("--limit",type=int,default=-1)
 parser.add_argument("--test_limit",type=int,default=-1)
 parser.add_argument("--resolution",type=int,default=256)
-parser.add_argument("--space",type=str,default="vae",choices=["vae","vq","pixel"])
-parser.add_argument("--vae",type=str,default="",help="autoencoder repo; defaults to stabilityai/sd-vae-ft-mse (vae) or CompVis/ldm-celebahq-256 (vq)")
+parser.add_argument("--space",type=str,default="vae",choices=["vae","vq","flux2","pixel"])
+parser.add_argument("--vae",type=str,default="",help="autoencoder repo; defaults to stabilityai/sd-vae-ft-mse (vae), CompVis/ldm-celebahq-256 (vq) or black-forest-labs/FLUX.2-dev (flux2, gated)")
 parser.add_argument("--clip_model",type=str,default="openai/clip-vit-large-patch14")
 parser.add_argument("--batch_size",type=int,default=32)
 parser.add_argument("--mixed_precision",type=str,default="fp16",choices=["no","fp16","bf16"])
@@ -52,7 +53,7 @@ def main(args):
     if device=="cpu":
         torch_dtype=torch.float32
     store_dtype={"float32":torch.float32,"float16":torch.float16}[args.store_dtype]
-    vae_name=args.vae or {"vae":"stabilityai/sd-vae-ft-mse","vq":"CompVis/ldm-celebahq-256"}.get(args.space)
+    vae_name=args.vae or {"vae":"stabilityai/sd-vae-ft-mse","vq":"CompVis/ldm-celebahq-256","flux2":"black-forest-labs/FLUX.2-dev"}.get(args.space)
 
     def load(split:str,limit:int):
         return load_images(args.dataset,split,limit,args.data_files,args.shuffle,args.seed)

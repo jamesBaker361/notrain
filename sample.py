@@ -157,7 +157,8 @@ def main(args):
         banks=build_pyramid_banks(images,args.coarse_size,args.patch_size,prior,w,heat,args.heatmap_lambda,
                                   keep,args.heatmap_random,generator)
         info={"patches_per_level":[b["patches"].shape[0] for b in banks],
-              "patches_kept":sum(b["patches"].shape[0] for b in banks)/sum(b["n_total"] for b in banks)}
+              # no patch levels when --coarse_size is the full resolution: the CFDM alone
+              "patches_kept":sum(b["patches"].shape[0] for b in banks)/max(sum(b["n_total"] for b in banks),1)}
         print(f"prompt {p} w={w}: patch banks {info}")
         pyramid_banks[(p,w)]=(banks,info)
         return banks,info

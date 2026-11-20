@@ -3,7 +3,7 @@ train a text-conditioned flow-matching UNet (textunet.py) on the latents of a ca
 (embed.py then caption.py), so the network and the closed-form machines in els.py share one training set
 loss: || v_theta(z_t, t, c) - (x - eps) ||^2 with z_t = t x + (1-t) eps, t ~ U(0,1)
 captions are dropped (replaced by the empty caption) with prob --cfg_dropout for classifier-free guidance
---unconditional trains without text (no captions needed), e.g. the trained-DDPM baseline for the pixel tree
+--unconditional trains without text (no captions needed), e.g. a trained-DDPM baseline on a pixel bank
 usage: sbatch runpygpu_chip.sh train.py --bank banks/celeb.pt --name celeb_conv
        sbatch runpygpu_chip.sh train.py --bank banks/celeb.pt --name celeb_attn --attention
 '''

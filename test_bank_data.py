@@ -53,3 +53,29 @@ def test_unsharp_mask():
     # threshold leaves small noise alone
     noisy=0.2+0.01*torch.randn(1,3,16,16,generator=g)
     assert torch.allclose(unsharp_mask(noisy,1.0,1.0,threshold=0.05),noisy)
+
+
+def test_flux2_latents_match_pipeline():
+    # same normalization as Flux2Pipeline, un-patchified to (32,H/8,W/8); decoding inverts it
+    import pytest
+    diffusers=pytest.importorskip("diffusers")
+    if not hasattr(diffusers,"AutoencoderKLFlux2"):
+        pytest.skip("diffusers without FLUX.2")
+    from diffusers.pipelines.flux2.pipeline_flux2 import Flux2Pipeline
+    from bank import encode_vae,decode_vae
+    torch.manual_seed(0)
+    vae=diffusers.AutoencoderKLFlux2(block_out_channels=(8,8,8,8),norm_num_groups=4,latent_channels=4,layers_per_block=1).eval()
+    vae.bn.running_mean.normal_()
+    vae.bn.running_var.uniform_(0.5,2.0)
+    pixels=torch.rand(2,3,32,32)*2-1
+    z=encode_vae(vae,pixels)
+    assert z.shape==(2,4,4,4)
+    with torch.no_grad():
+        raw=vae.encode(pixels).latent_dist.mean
+    packed=Flux2Pipeline._patchify_latents(raw)
+    mean=vae.bn.running_mean.view(1,-1,1,1)
+    std=torch.sqrt(vae.bn.running_var.view(1,-1,1,1)+vae.config.batch_norm_eps)
+    assert torch.allclose(z,Flux2Pipeline._unpatchify_latents((packed-mean)/std),atol=1e-5)
+    with torch.no_grad():
+        expected=vae.decode(raw).sample
+    assert torch.allclose(decode_vae(vae,z),expected,atol=1e-4)

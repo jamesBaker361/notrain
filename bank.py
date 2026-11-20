@@ -1,6 +1,6 @@
 '''
-helpers for building and decoding the "bank": training points X (flattened pixels, SD-VAE latents, or the
-VQ latents of CompVis/ldm-celebahq-256) and their CLIP image embeddings T
+helpers for building and decoding the "bank": training points X (flattened pixels, SD-VAE latents, the
+VQ latents of CompVis/ldm-celebahq-256, or FLUX.2 latents) and their CLIP image embeddings T
 '''
 import math
 import torch
@@ -51,10 +51,15 @@ def encode_texts_clip_tokens(model:CLIPModel,processor,texts:list,device):
 def load_vae(vae_name:str,device,torch_dtype=torch.float32,space:str="vae"):
     '''
     space "vae": an AutoencoderKL repo (e.g. stabilityai/sd-vae-ft-mse); space "vq": the VQ autoencoder in the
-    vqvae subfolder of a latent-diffusion repo (e.g. CompVis/ldm-celebahq-256)
+    vqvae subfolder of a latent-diffusion repo (e.g. CompVis/ldm-celebahq-256); space "flux2": the
+    AutoencoderKLFlux2 in the vae subfolder of black-forest-labs/FLUX.2-dev (gated: accept its license on the Hub
+    and log in; needs diffusers>=0.36)
     '''
     if space=="vq":
         return VQModel.from_pretrained(vae_name,subfolder="vqvae",torch_dtype=torch_dtype).to(device).eval()
+    if space=="flux2":
+        from diffusers import AutoencoderKLFlux2
+        return AutoencoderKLFlux2.from_pretrained(vae_name,subfolder="vae",torch_dtype=torch_dtype).to(device).eval()
     return AutoencoderKL.from_pretrained(vae_name,torch_dtype=torch_dtype).to(device).eval()
 
 
@@ -65,9 +70,32 @@ def load_bank_vae(bank:dict,device,torch_dtype=torch.float32):
     return load_vae(bank["vae"],device,torch_dtype,bank["space"])
 
 
+def _is_flux2(vae)->bool:
+    # by name, so older diffusers without AutoencoderKLFlux2 still import this module
+    return type(vae).__name__=="AutoencoderKLFlux2"
+
+
+def _flux2_stats(vae,like:torch.Tensor):
+    '''
+    FLUX.2 normalizes its 2x2-patchified latents (4*32 channels) with the VAE's BatchNorm running statistics
+    instead of a scaling factor (Flux2Pipeline); returns that mean and std, (1,128,1,1)
+    '''
+    mean=vae.bn.running_mean.view(1,-1,1,1).to(like)
+    std=torch.sqrt(vae.bn.running_var.view(1,-1,1,1)+vae.config.batch_norm_eps).to(like)
+    return mean,std
+
+
 @torch.no_grad()
 def encode_vae(vae,pixels:torch.Tensor)->torch.Tensor:
     # pixels in [-1,1]
+    if _is_flux2(vae):
+        # normalized exactly as Flux2Pipeline does, then un-patchified back to (32,H/8,W/8): the same values the
+        # FLUX.2 transformer sees, on the finer 8x grid, which leaves the pyramid sampler more levels
+        r=vae.config.patch_size[0]
+        assert pixels.shape[-1]%(8*r)==0 and pixels.shape[-2]%(8*r)==0,f"FLUX.2 latents need sides divisible by {8*r}"
+        latents=vae.encode(pixels.to(vae.dtype)).latent_dist.mean.float()
+        mean,std=_flux2_stats(vae,latents)
+        return F.pixel_shuffle((F.pixel_unshuffle(latents,r)-mean)/std,r)
     if isinstance(vae,VQModel):
         # pre-quantization latents, the space latent diffusion samples in (LDMPipeline decodes them unscaled)
         return vae.encode(pixels.to(vae.dtype)).latents.float()
@@ -78,6 +106,11 @@ def encode_vae(vae,pixels:torch.Tensor)->torch.Tensor:
 
 @torch.no_grad()
 def decode_vae(vae,latents:torch.Tensor)->torch.Tensor:
+    if _is_flux2(vae):
+        r=vae.config.patch_size[0]
+        mean,std=_flux2_stats(vae,latents.float())
+        latents=F.pixel_shuffle(F.pixel_unshuffle(latents.float(),r)*std+mean,r)
+        return vae.decode(latents.to(vae.dtype)).sample.float()
     if isinstance(vae,VQModel):
         return vae.decode(latents.to(vae.dtype)).sample.float()
     return vae.decode((latents/vae.config.scaling_factor).to(vae.dtype)).sample.float()
