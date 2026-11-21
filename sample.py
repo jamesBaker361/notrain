@@ -130,8 +130,12 @@ def main(args):
             assert os.path.exists(path),f"heatmaps need the bank's CLIP token embeddings: run clip_tokens.py --bank {args.bank} (missing {path})"
             # memory-mapped: only the patch images' rows are read
             bank_tokens=torch.load(path,weights_only=False,mmap=True)
+            # possibly shared with banks of the same images in other spaces: the rows must be the same images, in
+            # order, which their CLIP image embeddings show (up to the precision each bank was embedded in)
             assert bank_tokens["clip_model"]==bank["clip_model"] and bank_tokens["tokens"].shape[0]==X.shape[0],\
                 f"{path} doesn't match the bank ({bank_tokens['clip_model']}, {bank_tokens['tokens'].shape[0]} rows)"
+            same=(bank_tokens["T"].float().to(device)*T).sum(-1).min().item()
+            assert same>0.98,f"{path} was built from different images than {args.bank} (min CLIP cosine {same:.3f})"
             print(f"CLIP tokens {tuple(bank_tokens['tokens'].shape)} from {path} (last {bank_tokens['n_layers']} layers)")
         pyramid_banks={}
     print(f"median pairwise distance {scale:.4f}, sigma {sigma:.4f}")

@@ -1,0 +1,141 @@
+% Methodology section. Citation keys are placeholders: match them to your .bib.
+\section{Method}
+\label{sec:method}
+
+We generate text-conditioned images without training any network. Every sample is assembled from a fixed bank of training images by closed-form denoisers. A smoothed closed-form diffusion model sets the global layout at low resolution. At each finer scale, a closed-form patch denoiser adds real detail. Text guides both stages through CLIP~\cite{radford2021clip}: a prior over training images steers the layout, and a per-token decomposition of CLIP's image embedding steers patch selection~\cite{gandelsman2024interpreting}.
+
+Throughout, we use the interpolation $z_t = t\,x + (1-t)\,\varepsilon$ with $\varepsilon\sim\mathcal N(0,I)$ and $t\in[0,1]$, so $t=0$ is pure noise and $t=1$ is clean data.
+
+\subsection{Image bank}
+\label{sec:bank}
+
+The bank holds $N$ training images $\{x_i\}_{i=1}^N$ in one of four representations: pixels in $[-1,1]$; Stable Diffusion VAE latents ($4\times32\times32$ at $256$px); the VQ latents of a CelebA-HQ latent diffusion model ($3\times64\times64$); or FLUX.2 autoencoder latents. FLUX.2 latents are normalized exactly as in its pipeline: the latents are $2\times2$-patchified, standardized with the autoencoder's BatchNorm running statistics, and then un-patchified to $32\times\frac H8\times\frac W8$. Un-patchifying keeps the same values on the finer spatial grid, which leaves more pyramid levels (Sec.~\ref{sec:pyramid}). All operations below act on whichever representation the bank uses. Samples are decoded to pixels only for display and evaluation.
+
+For every image we also store two CLIP quantities (ViT-L/14). The first is its normalized image embedding $\tau_i$. The second is a grid of per-token embeddings $e_{i,ab}$, $a,b\in\{1,\dots,g\}$ with $g=16$ (Sec.~\ref{sec:tokens}). CLIP sees the same center crop of the original image that is resized into the bank, so token cell $(a,b)$ covers the same region of $x_i$ at every resolution and in every representation. The token embeddings therefore depend only on the image set. They are computed once per dataset and shared by all banks of the same images.
+
+\subsection{Text prior over training images}
+\label{sec:prior}
+
+For a prompt $c$ with normalized CLIP text embedding $\hat c$, the prior over training images is CLIP's retrieval distribution
+\begin{equation}
+  \log p(x_i\mid c) = \log\operatorname{softmax}_i\!\big(s\,\langle \hat c,\tau_i\rangle\big),
+  \label{eq:prior}
+\end{equation}
+where $s$ is CLIP's logit scale. The prior does not depend on $z_t$, so it is computed once per prompt. A guidance weight $w$ scales it in every denoiser below. $w=0$ is unconditional, $w=1$ is the exact conditional model, and $w>1$ sharpens the conditioning, as in classifier-free guidance.
+
+\subsection{Coarse layout: smoothed closed-form diffusion}
+\label{sec:coarse}
+
+The pyramid has levels $\ell=0,\dots,J$. Level $0$ is full resolution and each coarser level halves both sides, until the short side reaches $S_J$. We downsample the bank to the coarsest level (bicubic, antialiased), giving points $x_i^{(J)}$, and sample there with the text-conditioned smoothed closed-form diffusion model (CFDM) of Scarvelis et al.~\cite{scarvelis2023closed}. The optimal denoiser of the conditional empirical mixture $\rho_t(z\mid c)=\sum_i p(x_i\mid c)\,\mathcal N(z;\,t x_i^{(J)},(1-t)^2 I)$ is
+\begin{equation}
+  k_t(z) = \sum_i \operatorname{softmax}_i\!\Big(-\frac{\lVert z-t x_i^{(J)}\rVert^2}{2(1-t)^2} + w\log p(x_i\mid c)\Big)\, t\,x_i^{(J)}.
+  \label{eq:kt}
+\end{equation}
+The exact model only reproduces training images. Following~\cite{scarvelis2023closed}, we smooth the denoiser by averaging it over $M$ Gaussian perturbations of its input,
+$\tilde k_t(z)=\frac1M\sum_{m=1}^M k_t(z+\sigma\xi_m)$ with $\xi_m\sim\mathcal N(0,I)$. The smoothing scale is $\sigma=0.25\,\bar d$, where $\bar d$ is the median pairwise distance between bank points at level $J$.
+
+We integrate the probability-flow velocity $v_t(z)=(\tilde k_t(z)-t z)/\big(t(1-t)\big)$ with forward Euler from $t_0$ to $1$. The last step lands on $\tilde k_t(z)/t$. Sampling starts exactly from the noised mixture at $t_0$: draw $I\sim\operatorname{softmax}(w\log p(x_i\mid c))$ and set $z_{t_0}=t_0\,x_I^{(J)}+(1-t_0)\varepsilon$.
+
+For efficiency, Eq.~\eqref{eq:kt} sums over only the $K_c$ images with the highest prior, with the prior renormalized over them. We report the share of the $w$-sharpened prior mass this subset keeps. At $w=0$ the full bank is used, since a retrieval subset would itself be text conditioning. The result is a coarse sample $x^{(J)}$, usually a plausible low-resolution combination of a few training images.
+
+\subsection{Detail: closed-form patch denoising across the pyramid}
+\label{sec:pyramid}
+
+Averaging whole training images is plausible at coarse resolution but ghosts fine detail. We therefore add detail level by level, from $\ell=J-1$ down to $0$, with the closed-form patch denoiser of Qiu et al.~\cite{qiu2025efficient}, extended from a single image to a retrieved set.
+
+\paragraph{Patch bank.}
+At level $\ell$ we take the $K_p$ images with the highest prior (Eq.~\eqref{eq:prior}), resize them to that level, and extract every stride-1 $p\times p$ patch, $\{y_j\}_{j=1}^{P_\ell}$. Each patch $j$ comes from a parent image $\pi(j)$ and carries a logit bias $\beta_j$ (Sec.~\ref{sec:filter}).
+
+\paragraph{Denoiser.}
+For a noisy query patch $q$ at time $t$, the posterior-mean estimate of the clean patch is
+\begin{equation}
+  D_t(q) = \sum_j \operatorname{softmax}_j\!\Big(-\frac{\lVert q-t\,y_j\rVert^2}{2(1-t)^2} + \beta_j\Big)\, y_j .
+  \label{eq:patch}
+\end{equation}
+We apply Eq.~\eqref{eq:patch} to every stride-1 patch of the current image $z_t$. The overlapping estimates are folded back as a weighted average: each pixel takes the estimates of all patches covering it, weighted by a separable Gaussian window over the patch's $[-1,1]^2$ coordinates, $\omega(u,v)=\exp\!\big(-\tfrac{u^2+v^2}{2\rho^2}\big)$. This gives a clean image estimate $\hat x_t$.
+
+\paragraph{Coarse-to-fine blend.}
+We tie each level to the finished level below it with a Laplacian two-scale blend,
+\begin{equation}
+  B(\hat x, x^{(\ell+1)}) = \mathcal U\big(x^{(\ell+1)}\big) + \hat x - \mathcal U\big(\mathcal D(\hat x)\big),
+  \label{eq:blend}
+\end{equation}
+where $\mathcal D$ and $\mathcal U$ are bicubic down- and upsampling between the two levels. The patches supply only the detail band, $\hat x-\mathcal U(\mathcal D(\hat x))$, and the low frequencies come from level $\ell+1$. The patch denoiser can therefore sharpen the CFDM layout but cannot move it.
+
+\paragraph{Sampling a level.}
+Each level runs $T_p$ DDIM-style steps from pure noise on the grid $0=t_0<\dots<t_{T_p}=1$. At step $t\to t'$:
+\begin{align}
+  \hat\varepsilon &= \frac{z_t - t\,\hat x_t}{1-t}, \qquad \tilde x = B\big(\hat x_t, x^{(\ell+1)}\big), \\
+  z_{t'} &= t'\,\tilde x + (1-t')\Big(\sqrt{1-\eta^2}\,\hat\varepsilon + \eta\,\xi\Big),\quad \xi\sim\mathcal N(0,I).
+\end{align}
+As in~\cite{qiu2025efficient}, the noise is estimated before the blend, and the last step returns $\hat x_t$ without blending. $\eta=0$ is deterministic. The finished level $x^{(\ell)}$ conditions the next finer level, and $x^{(0)}$ is the output.
+
+\subsection{Text-relevant patches from CLIP's token decomposition}
+\label{sec:tokens}
+
+The prior of Eq.~\eqref{eq:prior} scores whole images. To score parts of images, we decompose CLIP's image embedding over spatial tokens, following Gandelsman et al.~\cite{gandelsman2024interpreting}.
+
+\paragraph{Per-token embeddings.}
+Up to the final LayerNorm, the class-token output of a ViT is a sum of residual contributions. The direct contributions of the last few attention layers carry almost all of the zero-shot signal~\cite{gandelsman2024interpreting}. Each such contribution is itself a sum over image tokens: in layer $l$, token $n$ contributes
+$\sum_h \alpha^{l,h}_{0n}\, W_O^{l,h} W_V^{l,h} \mathrm{LN}(h^{l}_n)$, where $\alpha^{l,h}_{0n}$ is head $h$'s attention from the class token to token $n$. We sum these over the last $L=4$ layers. We map the sum into the joint image--text space by linearizing the final LayerNorm at the full residual $r$ (centering the term and dividing by $\mathrm{std}(r)$, then applying its gain and the visual projection). Finally we divide by the norm of the image embedding. This gives one vector $e_{i,ab}$ per token cell, whose inner products with a text embedding sum over the grid to approximately the image--text cosine similarity.
+
+\paragraph{Heatmaps.}
+For a prompt $c$, the heat of token $(a,b)$ of image $i$ is its inner product with the prompt, minus the mean over a reference set $\mathcal R$:
+\begin{equation}
+  H_{i,ab}(c) = \langle e_{i,ab},\hat c\rangle - \frac{1}{|\mathcal R|}\sum_{c'\in\mathcal R}\langle e_{i,ab},\hat c'\rangle .
+\end{equation}
+$\mathcal R$ contains all prompts of the experiment and a few generic captions (``a photo.'', ``an image.'', ``a picture.''). Subtracting it removes the text-independent component shared by all raw maps.
+
+\subsection{Mapping tokens to patches: weighting and filtering}
+\label{sec:filter}
+
+Each CLIP token covers a $\frac{H_\ell}{g}\times\frac{W_\ell}{g}$ cell of level $\ell$, and many denoiser patches overlap it. Along the vertical axis, patch row $y$ (pixels $[y,y+p)$) shares
+\begin{equation}
+  O^{\ell}_{ya} = \Big|\,[y,\,y+p)\ \cap\ \big[\tfrac{(a-1)H_\ell}{g},\,\tfrac{aH_\ell}{g}\big)\Big|
+\end{equation}
+pixels with token row $a$. The horizontal axis is analogous ($O^{\ell}_{xb}$), so patch $(y,x)$ and token $(a,b)$ share $O^{\ell}_{ya}O^{\ell}_{xb}$ pixels. The same token grid applies to every level, so the token-to-patch map is exact at all scales, including fractional cell boundaries.
+
+\paragraph{Patch weighting.}
+A patch's text score is the overlap-weighted mean heat of the tokens it covers,
+$\mathrm{score}_j = \frac{1}{p^2}\sum_{a,b} O^{\ell}_{y_j a}\,O^{\ell}_{x_j b}\,H_{\pi(j),ab}(c)$.
+We standardize the score over the level's patch bank to get $\hat{\mathrm{score}}_j$, and set the bias in Eq.~\eqref{eq:patch} to
+\begin{equation}
+  \beta_j = w\log p\big(x_{\pi(j)}\mid c\big) + \lambda\,\hat{\mathrm{score}}_j .
+\end{equation}
+
+\paragraph{Patch filtering.}
+Optionally, we keep only the fraction $\kappa$ of tokens with the highest heat across all $K_p$ retrieved images. We then keep every patch that shares at least one pixel with a kept token. Because every output region snaps to some patch, a bank of only text-relevant patches would tile them everywhere. We therefore also keep a random fraction $r$ of the remaining patches. The kept tokens are the same at every level, and each maps to the patches overlapping it at that level.
+
+At $w=0$, we use $K_p$ uniformly random images with no bias and no filtering.
+
+\subsection{Implementation details}
+\label{sec:impl}
+
+Unless stated otherwise: $K_c=1000$, $\sigma=0.25\,\bar d$, $M=4$, $t_0=0.2$, and $50$ Euler steps for the CFDM; $T_p=10$ steps per patch level, $\rho=0.2$, $\eta=0$, and $K_p=50$. The pyramid geometry depends on the resolution:
+\begin{itemize}
+  \item $32\times32$ pixels and $32\times32$ latents: $S_J=8$, $p=5$;
+  \item $64\times64$ pixels and VQ latents: $S_J=16$, $p=7$;
+  \item $256\times256$ pixels: $S_J=16$, $p=7$, and $K_p=10$.
+\end{itemize}
+We compare five patch-selection variants:
+\begin{itemize}
+  \item no heatmap ($\lambda=0$, $\kappa=1$);
+  \item weighting only ($\lambda=1$);
+  \item strict filtering ($\kappa=0.25$, $r=0$);
+  \item filtering with random patches ($\kappa=0.25$, $r=0.25$);
+  \item filtering with random patches plus weighting ($\kappa=0.25$, $r=0.25$, $\lambda=1$).
+\end{itemize}
+We also run the whole-image CFDM at full resolution as a baseline. Equations~\eqref{eq:kt} and~\eqref{eq:patch} drop $\lVert z\rVert^2$, which is constant over components, and are evaluated in chunks of queries in single precision. For $256$px pixel banks, the bank stays in CPU memory and only the retrieved images are moved to the GPU.
+
+\subsection{Evaluation}
+\label{sec:eval}
+
+We sweep $w\in\{0,1,4\}$. For each $w$ we generate $500$ samples split evenly across prompts, and report:
+\begin{itemize}
+  \item FID and KID (subset size $100$) against $2000$ held-out images (FID is biased at this sample size, so we compare it only between runs with the same $N$), and against $2000$ training images; a much better score against training images than against held-out images indicates memorization;
+  \item $k$-NN precision and recall ($k=3$) in the same Inception feature space;
+  \item copy rates: the distance to the nearest training image, relative to $\bar d$, and the nearest-neighbour cosine similarity in DINOv2 feature space~\cite{oquab2023dinov2};
+  \item text alignment, measured with an independent CLIP ViT-B/16 so the conditioning model does not grade itself: CLIP score, and prompt accuracy, the fraction of samples whose best-matching prompt is their own;
+  \item diversity: mean pairwise LPIPS~\cite{zhang2018lpips} among samples of the same prompt.
+\end{itemize}
+Baselines are diffusion models trained on the same images: public checkpoints as-is, the same checkpoints fine-tuned with cross-attention to CLIP text tokens, and the same architectures trained from scratch on the bank. Following~\cite{lukoianov2025locality}, we also measure how well closed-form denoisers (the ideal denoiser, the CFDM, and the local score machine of~\cite{kamb2024analytic}) predict a trained network's samples from shared initial noise.

@@ -148,6 +148,19 @@ SETTINGS["celebahq_flux2"]={
     "prompts":"prompts/celeb.txt",
     "train":SETTINGS["celebahq_ldm"]["train"],
 }
+# CLIP token embeddings (clip_tokens.py) depend only on which images a bank holds, not on its space or resolution:
+# CLIP always sees the original image. Settings whose embed flags agree once those are stripped share one file,
+# banks/<dataset>_tokens.pt (e.g. all four CelebA-HQ banks), or banks/<first setting>_tokens.pt when two
+# different image sets share a dataset prefix (ImageNet's 64px dataset vs its 256px one)
+REPRESENTATION_FLAGS=r"--(space|vae|resolution|store_dtype|batch_size|mixed_precision) \S+"
+groups={}
+for name,cfg in SETTINGS.items():
+    groups.setdefault(" ".join(re.sub(REPRESENTATION_FLAGS,"",cfg["embed"]).split()),[]).append(name)
+for members in groups.values():
+    prefix=members[0].split("_")[0]
+    ambiguous=sum(m[0].split("_")[0]==prefix for m in groups.values())>1
+    for name in members:
+        SETTINGS[name]["tokens"]=f"banks/{members[0] if ambiguous else prefix}_tokens.pt"
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","train","sample","sample_closed","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
@@ -195,6 +208,8 @@ def sbatch(job:str,log:str,cmd:str,dependency:str="",script:str="runpygpu_chip.s
     return f"sbatch --parsable {dep}-J {job} --err=slurm_chip/{log}.err --out=slurm_chip/{log}.out {script} {cmd}"
 
 
+# shared token files already submitted by an earlier setting in this run
+tokens_queued=set()
 for name in settings:
     cfg=SETTINGS[name]
     bank=f"banks/{name}.pt"
@@ -222,8 +237,11 @@ for name in settings:
             jobs.append(("embed_"+name,"embed/"+name,f"embed.py {cfg['embed']} --save_path {bank}"))
         if cfg["blip"] and captioned is False:
             jobs.append(("caption_"+name,"caption/"+name,f"caption.py --bank {bank} {cfg.get('caption','')}"))
-        if captioned is not None and not os.path.exists(os.path.splitext(bank)[0]+"_tokens.pt"):
-            jobs.append(("tokens_"+name,"tokens/"+name,f"clip_tokens.py --bank {bank}"))
+        # one shared token file per image set, from whichever of its banks comes first
+        if captioned is not None and not os.path.exists(cfg["tokens"]) and cfg["tokens"] not in tokens_queued:
+            tokens_queued.add(cfg["tokens"])
+            log=os.path.basename(cfg["tokens"])[:-3]
+            jobs.append(("tokens_"+name,"tokens/"+log,f"clip_tokens.py --bank {bank} --save_path {cfg['tokens']}"))
         if captioned is not None and not jobs:
             print(f"# {name}: bank, captions and CLIP tokens already built",file=sys.stderr)
         parts=[]
@@ -244,7 +262,7 @@ for name in settings:
         if cfg.get("cfdm",True):
             runs["cfdm"]=f"--method cfdm {cfdm_flags}"
         for variant,flags in pyramid_variants.items():
-            runs[variant]=f"--method pyramid {cfdm_flags} --pyramid_steps 10 {cfg.get('pyramid','')} {flags}"
+            runs[variant]=f"--method pyramid {cfdm_flags} --pyramid_steps 10 {cfg.get('pyramid','')} --tokens {cfg['tokens']} {flags}"
         for label,flags in runs.items():
             run=f"{name}_{label}{sharp_suffix}"
             if finished(f"outputs/{run}"):

@@ -7,7 +7,9 @@ via text-based decomposition", the clip_text_span submodule; heatmap.py) next to
 the images are re-read from the dataset with the bank's embed.py args (as caption.py does) and seen exactly as
 for T: CLIP's center crop of the original image, which is also the crop embed.py resized into X. So token
 (i,j) covers the (i,j) cell of X at any resolution, and pyramid.py maps it to the denoiser patches overlapping
-it at each level. ~0.4MB per image (11GB for 28k), saved to <bank>_tokens.pt and memory-mapped by sample.py
+it at each level. ~0.4MB per image (11GB for 28k), saved to <bank>_tokens.pt (or --save_path) and memory-mapped
+by sample.py. The tokens don't depend on the bank's space or resolution, so banks of the same images (e.g. CelebA-HQ
+as 64px pixels, 256px pixels and latents) can share one file
 usage: sbatch runpygpu_chip.sh clip_tokens.py --bank banks/celebahq_pix64.pt
 '''
 import argparse
@@ -51,7 +53,10 @@ def main(args):
         if (start//args.batch_size)%20==0:
             print(f"\t tokens {start+len(images)}/{len(dataset)}")
     save_path=args.save_path or tokens_path(args.bank)
-    torch.save({"tokens":tokens,"clip_model":bank["clip_model"],"n_layers":args.n_layers,"args":vars(args)},save_path)
+    # T identifies the rows: banks of the same images in other spaces share this file (sample.py --tokens), and
+    # sample.py checks their T against it
+    torch.save({"tokens":tokens,"T":bank["T"].half().clone(),"clip_model":bank["clip_model"],"n_layers":args.n_layers,
+                "args":vars(args)},save_path)
     print(f"saved tokens {tuple(tokens.shape)} ({tokens.numel()*2/1e9:.1f}GB) to {save_path}")
 
 
