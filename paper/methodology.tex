@@ -9,7 +9,7 @@ Throughout, we use the interpolation $z_t = t\,x + (1-t)\,\varepsilon$ with $\va
 \subsection{Image bank}
 \label{sec:bank}
 
-The bank holds $N$ training images $\{x_i\}_{i=1}^N$ in one of four representations: pixels in $[-1,1]$; Stable Diffusion VAE latents ($4\times32\times32$ at $256$px); the VQ latents of a CelebA-HQ latent diffusion model ($3\times64\times64$); or FLUX.2 autoencoder latents. FLUX.2 latents are normalized exactly as in its pipeline: the latents are $2\times2$-patchified, standardized with the autoencoder's BatchNorm running statistics, and then un-patchified to $32\times\frac H8\times\frac W8$. Un-patchifying keeps the same values on the finer spatial grid, which leaves more pyramid levels (Sec.~\ref{sec:pyramid}). All operations below act on whichever representation the bank uses. Samples are decoded to pixels only for display and evaluation.
+The bank holds $N$ training images $\{x_i\}_{i=1}^N$, the $28$k training faces of CelebA-HQ~\cite{karras2018progressive}, with BLIP~\cite{li2022blip} captions, in one of four representations: pixels in $[-1,1]$ at $64\times64$ or $256\times256$; the $3\times64\times64$ VQ latents of the CelebA-HQ latent diffusion model~\cite{rombach2022ldm}; or the latents of the FLUX.2 autoencoder. FLUX.2 latents are normalized exactly as in its pipeline: the latents are $2\times2$-patchified, standardized with the autoencoder's BatchNorm running statistics, and then un-patchified to $32\times\frac H8\times\frac W8$. Un-patchifying keeps the same values on the finer spatial grid, which leaves more pyramid levels (Sec.~\ref{sec:pyramid}). All operations below act on whichever representation the bank uses. Samples are decoded to pixels only for display and evaluation.
 
 For every image we also store two CLIP quantities (ViT-L/14). The first is its normalized image embedding $\tau_i$. The second is a grid of per-token embeddings $e_{i,ab}$, $a,b\in\{1,\dots,g\}$ with $g=16$ (Sec.~\ref{sec:tokens}). CLIP sees the same center crop of the original image that is resized into the bank, so token cell $(a,b)$ covers the same region of $x_i$ at every resolution and in every representation. The token embeddings therefore depend only on the image set. They are computed once per dataset and shared by all banks of the same images.
 
@@ -113,9 +113,9 @@ At $w=0$, we use $K_p$ uniformly random images with no bias and no filtering.
 
 Unless stated otherwise: $K_c=1000$, $\sigma=0.25\,\bar d$, $M=4$, $t_0=0.2$, and $50$ Euler steps for the CFDM; $T_p=10$ steps per patch level, $\rho=0.2$, $\eta=0$, and $K_p=50$. The pyramid geometry depends on the resolution:
 \begin{itemize}
-  \item $32\times32$ pixels and $32\times32$ latents: $S_J=8$, $p=5$;
-  \item $64\times64$ pixels and VQ latents: $S_J=16$, $p=7$;
-  \item $256\times256$ pixels: $S_J=16$, $p=7$, and $K_p=10$.
+  \item $64\times64$ pixels and $3\times64\times64$ VQ latents: $S_J=16$, $p=7$;
+  \item $256\times256$ pixels: $S_J=16$, $p=7$, and $K_p=10$;
+  \item $32\times32\times32$ FLUX.2 latents: $S_J=8$, $p=5$.
 \end{itemize}
 We compare five patch-selection variants:
 \begin{itemize}

@@ -1,25 +1,14 @@
 # closed-form samplers (whole-image CFDM, and the CFDM -> patch pyramid of pyramid.py) vs trained diffusion models,
-# on standard datasets:
-#   cifar10_pix32    uoft-cs/cifar10 (test split held out), pixels 32x32,   nets from google/ddpm-cifar10-32
-#   celebahq_pix256  korexyz/celeba-hq-256x256 (validation held out), pixels 256x256, nets from google/ddpm-celebahq-256
-#   celebahq_ldm     same data in the VQ latents (3x64x64) of CompVis/ldm-celebahq-256, nets from that LDM
-#   celebahq_pix64   same faces as pixels at 64x64 (the locality paper's setting); no 64px checkpoint exists, so the
-#                    nets are the celebahq-256 architecture run at 64x64 with cross-attention (from scratch, and
-#                    fine-tuned from the 256px weights)
-#   imagenet_pix64   30k shuffled images of benjamin-paine/imagenet-1k-64x64 (2k of validation held out), BLIP captions
-#   wikiart_pix64    the first 20 of huggan/wikiart's 72 (already shuffled) shards, ~22k paintings (1k held out),
-#                    captions = BLIP + style, genre and artist
-#   league_pix64     jlbaker361/league-splash-tagged, 2000 splash arts (200 held out), captions = BLIP + skin and champion
-#   these three have no pretrained checkpoint, so their nets are the celebahq-256 architecture at 64x64 with
-#   cross-attention, trained from scratch
-#   {imagenet,wikiart,league}_pix256 and _ldm: the same data at 256x256 pixels, and in the 4x32x32 latents of the
-#   Stable Diffusion VAE (stabilityai/sd-vae-ft-mse; the CelebA-HQ LDM's VQ autoencoder was trained only on faces),
-#   set up like celebahq_pix256 / celebahq_ldm with scratch nets only (the ldm-celebahq-256 UNet with 4 channels at
-#   32x32). ImageNet at 256 comes from benjamin-paine/imagenet-1k-256x256's validation split (0.7GB, not
-#   class-sorted; 30k bank + 2k held out) rather than its 20GB train split
-#   {celebahq,imagenet,wikiart,league}_flux2: the same 256px images in the normalized 32x32x32 latents of the FLUX.2
-#   autoencoder (black-forest-labs/FLUX.2-dev, gated: accept its license and log in on the cluster), set up like
-#   the _ldm settings with a scratch net (the ldm-celebahq-256 UNet with 32 channels at 32x32)
+# on CelebA-HQ (korexyz/celeba-hq-256x256, validation split held out, BLIP captions) in four spaces:
+#   celebahq_pix64   pixels at 64x64 (the locality paper's setting); no 64px checkpoint exists, so the nets are the
+#                    celebahq-256 architecture run at 64x64 with cross-attention (from scratch, and fine-tuned from
+#                    the 256px weights)
+#   celebahq_pix256  pixels at 256x256, nets from google/ddpm-celebahq-256
+#   celebahq_ldm     the VQ latents (3x64x64) of CompVis/ldm-celebahq-256, nets from that LDM
+#   celebahq_flux2   the normalized 32x32x32 latents of the FLUX.2 autoencoder (black-forest-labs/FLUX.2-dev, gated:
+#                    accept its license and log in on the cluster); no checkpoint in that space, so one scratch net
+#                    (the ldm-celebahq-256 UNet with 32 channels at 32x32)
+# all four share one file of CLIP token embeddings (clip_tokens.py): CLIP sees the original images whatever the space
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
 # usage: python scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement|summarize [setting ...]
@@ -36,26 +25,22 @@ import zipfile
 stage=sys.argv[1] if len(sys.argv)>1 else "all"
 sharpen=os.environ.get("SHARPEN","")=="1"
 
-WIKIART_DATA="--dataset huggan/wikiart --data_files 'data/train-0000*.parquet' 'data/train-0001*.parquet' --holdout 1000 --metadata_columns artist genre style"
-WIKIART_CAPTION="--caption_template '{blip}, {style} {genre} by {artist}'"
-LEAGUE_DATA="--dataset jlbaker361/league-splash-tagged --shuffle --holdout 200 --metadata_columns champion tag"
-LEAGUE_CAPTION="--caption_template '{blip}, {tag} {champion} splash art'"
+CELEBAHQ="--dataset korexyz/celeba-hq-256x256 --test_split validation"
+# the token file is built from the first setting's bank (the 64px one, the smallest)
+TOKENS="banks/celebahq_tokens.pt"
 SETTINGS={
-    "cifar10_pix32":{
-        "embed":"--dataset uoft-cs/cifar10 --image_column img --test_split test --label_column label --space pixel --resolution 32",
-        "blip":False,
-        "base":"google/ddpm-cifar10-32",
-        "prompts":"prompts/cifar10.txt",
-        "train":"--batch_size 128 --max_steps 50000",
-        # 8 -> 16 -> 32: CFDM at 8x8, 5x5 patches at 16 and 32
-        "pyramid":"--coarse_size 8 --patch_size 5",
+    "celebahq_pix64":{
+        "embed":f"{CELEBAHQ} --space pixel --resolution 64",
+        "base":"google/ddpm-celebahq-256",
+        "sample_size":64,
+        "train":"--batch_size 64 --max_steps 100000",
+        # the 256px checkpoint as-is doesn't apply to 64px inputs
+        "nets":["ft","scratch"],
     },
     "celebahq_pix256":{
         # 28000 x 196608 pixels: stored in float16 (11GB) and kept in CPU memory by sample.py/agreement.py
-        "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space pixel --resolution 256 --store_dtype float16 --batch_size 16",
-        "blip":True,
+        "embed":f"{CELEBAHQ} --space pixel --resolution 256 --store_dtype float16 --batch_size 16",
         "base":"google/ddpm-celebahq-256",
-        "prompts":"prompts/celeb.txt",
         "train":"--batch_size 8 --gradient_checkpointing --max_steps 50000",
         # whole-bank cfdm would need the 11GB bank on the GPU; the pyramid only moves its patch images there, and
         # fewer of them, since every 256px image gives 62k patches
@@ -63,104 +48,27 @@ SETTINGS={
         "pyramid":"--coarse_size 16 --patch_size 7 --patch_images 10",
     },
     "celebahq_ldm":{
-        "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space vq --vae CompVis/ldm-celebahq-256 --resolution 256",
-        "blip":True,
+        "embed":f"{CELEBAHQ} --space vq --vae CompVis/ldm-celebahq-256 --resolution 256",
         "base":"CompVis/ldm-celebahq-256",
-        "prompts":"prompts/celeb.txt",
         "train":"--batch_size 16 --gradient_checkpointing --max_steps 50000",
         # the LDM UNet (274M parameters) trains on the bigger GPU nodes
         "train_script":"runpygpu_chip_heavy.sh",
     },
-    "celebahq_pix64":{
-        "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space pixel --resolution 64",
-        "blip":True,
-        "base":"google/ddpm-celebahq-256",
-        "sample_size":64,
-        "prompts":"prompts/celeb.txt",
-        "train":"--batch_size 64 --max_steps 100000",
-        # the 256px checkpoint as-is doesn't apply to 64px inputs
-        "nets":["ft","scratch"],
-    },
-    "imagenet_pix64":{
-        # sorted by class, hence --shuffle; captions are BLIP's (the class names are kept as metadata "label")
-        "embed":"--dataset benjamin-paine/imagenet-1k-64x64 --test_split validation --shuffle --limit 30000 --test_limit 2000 --metadata_columns label --space pixel --resolution 64",
-        "blip":True,
-        "base":"google/ddpm-celebahq-256",
-        "sample_size":64,
-        "prompts":"prompts/imagenet.txt",
-        "train":"--batch_size 64 --max_steps 100000",
+    "celebahq_flux2":{
+        # bf16: the FLUX.2 VAE upcasts in fp16
+        "embed":f"{CELEBAHQ} --space flux2 --resolution 256 --mixed_precision bf16",
+        "base":"CompVis/ldm-celebahq-256",
+        "sample_size":32,
+        "channels":32,
+        "train":"--batch_size 16 --gradient_checkpointing --max_steps 50000",
+        "train_script":"runpygpu_chip_heavy.sh",
         "nets":["scratch"],
-    },
-    "wikiart_pix64":{
-        # 20 shards ~ 9GB of the 34GB dataset; only a train split, so the last 1000 are held out
-        "embed":f"{WIKIART_DATA} --space pixel --resolution 64",
-        "blip":True,
-        "caption":WIKIART_CAPTION,
-        "base":"google/ddpm-celebahq-256",
-        "sample_size":64,
-        "prompts":"prompts/wikiart.txt",
-        "train":"--batch_size 64 --max_steps 100000",
-        "nets":["scratch"],
-    },
-    "league_pix64":{
-        # sorted by champion, hence --shuffle before the holdout; 1215x717 splashes are center-cropped to squares
-        "embed":f"{LEAGUE_DATA} --space pixel --resolution 64",
-        "blip":True,
-        "caption":LEAGUE_CAPTION,
-        "base":"google/ddpm-celebahq-256",
-        "sample_size":64,
-        "prompts":"prompts/league-splash-tagged.txt",
-        # only 1800 training images
-        "train":"--batch_size 64 --max_steps 20000",
-        "nets":["scratch"],
+        # 32x32 latents: CFDM at 8x8, 5x5 patches at 16 and 32
+        "pyramid":"--coarse_size 8 --patch_size 5",
     },
 }
-# the same three datasets at 256x256 pixels and in the LDM's VQ latents, configured like the CelebA-HQ settings
-for data,flags,caption,steps in [
-    ("imagenet","--dataset benjamin-paine/imagenet-1k-256x256 --data_files 'data/validation-*.parquet' --limit 32000 --holdout 2000","",50000),
-    ("wikiart",WIKIART_DATA,WIKIART_CAPTION,50000),
-    # only 1800 training images
-    ("league",LEAGUE_DATA,LEAGUE_CAPTION,20000),
-]:
-    for space,template,embed_flags,net_flags in [
-        ("pix256","celebahq_pix256","--space pixel --resolution 256 --store_dtype float16 --batch_size 16",{}),
-        # 4x32x32 latents: CFDM at 8x8, 5x5 patches at 16 and 32, as for CIFAR-10's pixels
-        ("ldm","celebahq_ldm","--space vae --vae stabilityai/sd-vae-ft-mse --resolution 256",{"sample_size":32,"channels":4}),
-        # 32x32x32 FLUX.2 latents (bf16: the VAE upcasts in fp16), same pyramid geometry
-        ("flux2","celebahq_ldm","--space flux2 --resolution 256 --mixed_precision bf16",{"sample_size":32,"channels":32}),
-    ]:
-        base=SETTINGS[template]
-        SETTINGS[f"{data}_{space}"]={
-            **base,
-            "embed":f"{flags} {embed_flags}",
-            "caption":caption,
-            "prompts":f"prompts/{'league-splash-tagged' if data=='league' else data}.txt",
-            "train":base["train"].replace("--max_steps 50000",f"--max_steps {steps}"),
-            "nets":["scratch"],
-            **net_flags,
-            **({"pyramid":"--coarse_size 8 --patch_size 5"} if space in ["ldm","flux2"] else {}),
-        }
-# CelebA-HQ in FLUX.2 latents: like the other _flux2 settings, on the faces of celebahq_ldm
-SETTINGS["celebahq_flux2"]={
-    **SETTINGS["wikiart_flux2"],
-    "embed":"--dataset korexyz/celeba-hq-256x256 --test_split validation --space flux2 --resolution 256 --mixed_precision bf16",
-    "caption":"",
-    "prompts":"prompts/celeb.txt",
-    "train":SETTINGS["celebahq_ldm"]["train"],
-}
-# CLIP token embeddings (clip_tokens.py) depend only on which images a bank holds, not on its space or resolution:
-# CLIP always sees the original image. Settings whose embed flags agree once those are stripped share one file,
-# banks/<dataset>_tokens.pt (e.g. all four CelebA-HQ banks), or banks/<first setting>_tokens.pt when two
-# different image sets share a dataset prefix (ImageNet's 64px dataset vs its 256px one)
-REPRESENTATION_FLAGS=r"--(space|vae|resolution|store_dtype|batch_size|mixed_precision) \S+"
-groups={}
-for name,cfg in SETTINGS.items():
-    groups.setdefault(" ".join(re.sub(REPRESENTATION_FLAGS,"",cfg["embed"]).split()),[]).append(name)
-for members in groups.values():
-    prefix=members[0].split("_")[0]
-    ambiguous=sum(m[0].split("_")[0]==prefix for m in groups.values())>1
-    for name in members:
-        SETTINGS[name]["tokens"]=f"banks/{members[0] if ambiguous else prefix}_tokens.pt"
+for cfg in SETTINGS.values():
+    cfg.update({"blip":True,"prompts":"prompts/celeb.txt","tokens":TOKENS})
 settings=sys.argv[2:] or list(SETTINGS)
 STAGES=["build","train","sample","sample_closed","sample_nets","agreement","summarize","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
