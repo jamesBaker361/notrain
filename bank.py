@@ -171,6 +171,35 @@ def load_images(dataset:str,split:str,limit:int=-1,data_files:list=None,shuffle:
     return ds
 
 
+def pixel_transform(resolution:int):
+    # PIL image -> (3,R,R) in [-1,1], as embed.py stores every bank
+    import torchvision.transforms as transforms
+    return transforms.Compose([
+        transforms.Resize(resolution),
+        transforms.CenterCrop(resolution),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5],[0.5])
+    ])
+
+
+def held_out_pixels(bank:dict,limit:int=-1)->torch.Tensor:
+    '''
+    the real images behind the bank's X_test, in order, as (n,3,R,R) pixels in [-1,1] (embed.py's transform):
+    a latent bank's X_test only decodes to its autoencoder's reconstructions, these are the images themselves
+    '''
+    a=bank["args"]
+    if a.get("test_split"):
+        ds=load_images(a["dataset"],a["test_split"],a.get("test_limit",-1),a.get("data_files"),a.get("shuffle",False),a.get("seed",123))
+    else:
+        # embed.py --holdout: the last rows of the training split
+        ds=load_images(a["dataset"],a["split"],a["limit"],a.get("data_files"),a.get("shuffle",False),a.get("seed",123))
+        ds=ds.select(range(bank["X"].shape[0],len(ds)))
+    assert len(ds)==bank["X_test"].shape[0],f"{len(ds)} held-out dataset rows for {bank['X_test'].shape[0]} X_test rows"
+    n=len(ds) if limit<=0 else min(limit,len(ds))
+    transform=pixel_transform(a["resolution"])
+    return torch.stack([transform(img.convert("RGB")) for img in ds.select(range(n))[a["image_column"]]])
+
+
 def bank_dataset(bank:dict):
     '''
     the dataset rows behind the bank's X, in order, from its stored embed.py args (held-out rows of embed.py

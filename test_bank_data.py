@@ -2,7 +2,7 @@ import os
 import torch
 from PIL import Image
 from datasets import Dataset,ClassLabel
-from bank import load_images,metadata_strings,compose_caption
+from bank import load_images,metadata_strings,compose_caption,held_out_pixels,pixel_transform
 
 
 def test_metadata_strings():
@@ -35,6 +35,21 @@ def test_load_images_shards_and_shuffle_are_reproducible(tmp_path):
     assert all(p[0] in (0,80) for p in pixel(a))
     full=load_images("imagefolder","train",data_files=files)
     assert len(full)==10 and sorted(pixel(full))==sorted(pixel(load_images("imagefolder","train",data_files=files,shuffle=True)))
+
+
+def test_held_out_pixels_holdout_rows(tmp_path):
+    # embed.py --holdout: X_test are the last rows of the training split
+    for i in range(5):
+        Image.new("RGB",(8,6),(i*50,0,0)).save(tmp_path/f"{i}.png")
+    files=[str(tmp_path/"*.png")]
+    ds=load_images("imagefolder","train",data_files=files)
+    args={"dataset":"imagefolder","split":"train","limit":-1,"data_files":files,"test_split":"","resolution":4,"image_column":"image"}
+    bank={"args":args,"X":torch.zeros(3,1),"X_test":torch.zeros(2,1)}
+    pixels=held_out_pixels(bank)
+    transform=pixel_transform(4)
+    expected=torch.stack([transform(ds[i]["image"].convert("RGB")) for i in [3,4]])
+    assert pixels.shape==(2,3,4,4) and torch.equal(pixels,expected)
+    assert held_out_pixels(bank,limit=1).shape[0]==1
 
 
 def test_unsharp_mask():

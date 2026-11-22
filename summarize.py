@@ -20,6 +20,7 @@ parser.add_argument("--label_width",type=int,default=150)
 # per-prompt metrics are averaged over prompts; fid_*/kid_* come from sample.py's --fid_samples pass ("__all__" rows)
 METRICS=["clip_score","prompt_accuracy","copy_rate","nn_dist","diversity","lpips_diversity","patches_kept","seconds_per_sample",
          "fid_test","kid_test","precision_test","recall_test","fid_train","kid_train","precision_train","recall_train",
+         "fid_real","kid_real","precision_real","recall_real",
          "fid_copy_rate","fid_nn_dist","dino_nn_sim","dino_copy_rate","fid_prompt_accuracy","fid_lpips_diversity","fid_seconds_per_sample"]
 
 
@@ -34,11 +35,15 @@ def run_label(args:dict)->str:
         label=f"pyramid c{args['coarse_size']} p{args['patch_size']}"
         if args.get("heatmap_keep",1.0)<1:
             label+=f" keep{args['heatmap_keep']}"+(f"+rand{args['heatmap_random']}" if args.get("heatmap_random") else "")
+            if args.get("heatmap_overlap"):
+                label+=f" ov{args['heatmap_overlap']}"
         if args.get("heatmap_lambda"):
             label+=f" hm{args['heatmap_lambda']}"
         return label
     if args.get("method","cfdm")=="cfdm":
         return f"cfdm K{args['top_k']}"
+    if args.get("method")=="retrieval":
+        return f"retrieval K{args['top_k']}"
     # runs from removed samplers (CLIP tree, top-K node samplers) are still listed, by method and run dir
     return f"{args['method']} [{os.path.basename(os.path.normpath(args.get('output_dir','')))}]"
 
@@ -50,7 +55,8 @@ def main(args):
     for d in run_dirs:
         with open(os.path.join(d,"metrics.json")) as f:
             m=json.load(f)
-        runs.append({"dir":d,"args":m["args"],"prompts":m["prompts"],"results":m["results"],"label":run_label(m["args"])})
+        runs.append({"dir":d,"args":m["args"],"prompts":m["prompts"],"results":m["results"],"label":run_label(m["args"]),
+                     "ceiling":m.get("ceiling")})
     # same settings on different banks (e.g. pixel vs latent) get the same label; tell them apart by run dir
     labels=[r["label"] for r in runs]
     for r in runs:
@@ -69,6 +75,13 @@ def main(args):
                 vals=[x[k] for x in rows if x.get(k) is not None]
                 entry[k]=float(np.mean(vals)) if vals else None
             table.append(entry)
+    # one FID ceiling row per bank (decoded training images scored like samples), from the first run that has it
+    ceilings={}
+    for r in runs:
+        if r.get("ceiling") and r["args"]["bank"] not in ceilings:
+            ceilings[r["args"]["bank"]]=r["ceiling"]
+    for b,c in ceilings.items():
+        table.append({"run":f"ceiling [{os.path.basename(b)}]","dir":"","w":"-",**{k:c.get(k) for k in METRICS}})
     # drop columns no run has (e.g. FID when --fid_samples wasn't used)
     columns=[k for k in METRICS if any(e[k] is not None for e in table)]
     table=[{k:v for k,v in e.items() if k in ["run","dir","w"]+columns} for e in table]

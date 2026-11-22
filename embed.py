@@ -15,9 +15,8 @@ import os
 import argparse
 import time
 import torch
-import torchvision.transforms as transforms
 from experiment_helpers.gpu_details import print_details
-from bank import load_images,metadata_strings,load_clip,encode_images_clip,encode_texts_clip,load_vae,encode_vae
+from bank import pixel_transform,load_images,metadata_strings,load_clip,encode_images_clip,encode_texts_clip,load_vae,encode_vae
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--dataset",type=str,default="korexyz/celeba-hq-256x256")
@@ -66,12 +65,7 @@ def main(args):
         bytes_per=2 if args.store_dtype=="float16" else 4
         print(f"pixel bank: {len(dataset)} x {d} = {len(dataset)*d*bytes_per/1e9:.1f}GB")
 
-    transform=transforms.Compose([
-        transforms.Resize(args.resolution),
-        transforms.CenterCrop(args.resolution),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5],[0.5])
-    ])
+    transform=pixel_transform(args.resolution)
 
     clip_model,clip_processor=load_clip(args.clip_model,device,torch_dtype)
     vae=load_vae(vae_name,device,torch_dtype,args.space) if args.space!="pixel" else None

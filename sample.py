@@ -8,6 +8,11 @@ each output row is: [top CLIP-retrieved training image | samples...] for one (pr
     with patches optionally weighted (--heatmap_lambda) and filtered (--heatmap_keep, --heatmap_random) by CLIP text heatmaps
     from the bank's CLIP token embeddings (clip_tokens.py)
 --method net: a trained diffusion model
+--method retrieval: the baseline every closed-form sampler has to beat, training images drawn from the w-sharpened
+    prior over the top-k CLIP matches (uniformly at w=0), i.e. the CFDM's sigma -> 0, exact-score limit
+with --fid_samples, a latent bank's samples are also scored against the real held-out images ("_real"), and every
+run records the FID "ceiling": decoded training images scored like samples (an autoencoder's reconstruction limit
+in latent spaces, the finite-sample floor in pixel space)
 '''
 import os
 import re
@@ -21,7 +26,7 @@ from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from cfdm import text_log_prior,top_k_subset,sample,median_distance
 from pyramid import pyramid_sizes,downsample_flat,build_pyramid_banks,sample_pyramid
-from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask,tokens_path
+from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask,tokens_path,held_out_pixels
 from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,prompt_accuracy
 
 parser=argparse.ArgumentParser()
@@ -30,7 +35,7 @@ parser.add_argument("--prompt_file",type=str,default="prompts/faces.txt",help="o
 parser.add_argument("--prompts",type=str,nargs="+",default=None,help="overrides --prompt_file")
 parser.add_argument("--n_per_prompt",type=int,default=8)
 parser.add_argument("--w",type=float,nargs="+",default=[0.0,1.0,4.0],help="text guidance weights to sweep; 0=unconditional, 1=exact conditional")
-parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","pyramid","net"],help="cfdm: smoothed CFDM at full resolution; pyramid: CFDM at --coarse_size, then closed-form patch levels; net: a trained diffusion model (--model)")
+parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","pyramid","net","retrieval"],help="cfdm: smoothed CFDM at full resolution; pyramid: CFDM at --coarse_size, then closed-form patch levels; net: a trained diffusion model (--model); retrieval: training images drawn from the prompt's top-k CLIP matches")
 parser.add_argument("--sigma",type=float,default=0.25,help="CFDM smoothing, as a fraction of the median pairwise distance between bank points (at the coarsest level for --method pyramid); 0 reproduces training points exactly")
 parser.add_argument("--M",type=int,default=4,help="noise samples per smoothed score evaluation")
 parser.add_argument("--steps",type=int,default=50,help="CFDM Euler steps (and the net's sampling steps)")
@@ -44,6 +49,7 @@ parser.add_argument("--fold_rho",type=float,default=0.2,help="pyramid: width of 
 parser.add_argument("--eta",type=float,default=0.0,help="pyramid: patch-level stochasticity in [0,1] (0 = deterministic DDIM)")
 parser.add_argument("--heatmap_lambda",type=float,default=0.0,help="pyramid: logit bonus per standard deviation of a patch's CLIP text-heatmap score (0 = off)")
 parser.add_argument("--heatmap_keep",type=float,default=1.0,help="pyramid: keep this fraction of CLIP tokens, those with the highest heat over the patch images, and every patch overlapping a kept token (1 = all)")
+parser.add_argument("--heatmap_overlap",type=float,default=0.0,help="pyramid: with --heatmap_keep < 1, the fraction of a patch's pixels that must lie inside kept tokens for it to be kept (0 = any pixel, 0.5 = at least half)")
 parser.add_argument("--heatmap_random",type=float,default=0.0,help="pyramid: with --heatmap_keep < 1, also keep this random fraction of the other patches")
 parser.add_argument("--tokens",type=str,default="",help="pyramid heatmaps: the bank's CLIP token embeddings from clip_tokens.py; defaults to <bank>_tokens.pt")
 parser.add_argument("--heatmap_baseline",type=str,nargs="+",default=["a photo.","an image.","a picture."],help="pyramid: generic texts whose heatmaps, with the other prompts', are averaged and subtracted")
@@ -167,7 +173,7 @@ def main(args):
         # no heatmap (w=0) means no filtering either
         keep=args.heatmap_keep if heat is not None else 1.0
         banks=build_pyramid_banks(images,args.coarse_size,args.patch_size,prior,w,heat,args.heatmap_lambda,
-                                  keep,args.heatmap_random,generator)
+                                  keep,args.heatmap_random,generator,args.heatmap_overlap)
         info={"patches_per_level":[b["patches"].shape[0] for b in banks],
               # no patch levels when --coarse_size is the full resolution: the CFDM alone
               "patches_kept":sum(b["patches"].shape[0] for b in banks)/max(sum(b["n_total"] for b in banks),1)}
@@ -191,6 +197,12 @@ def main(args):
             prior_mass=torch.softmax(w*log_priors[p],dim=-1)[sub].sum().item()
             if prior_mass<0.9:
                 print(f"warning: top_k={args.top_k} keeps only {prior_mass:.3f} of the prior mass for '{prompts[p]}' at w={w}")
+        if args.method=="retrieval":
+            if sub is None:
+                idx=torch.randint(X.shape[0],(n,),generator=generator,device=device)
+            else:
+                idx=sub[torch.multinomial(torch.softmax(w*log_prior,dim=-1),n,replacement=True,generator=generator)]
+            return X[idx.to(X.device)].to(device).float(),prior_mass,{}
         if args.method=="cfdm":
             X_w=X if sub is None else X[sub]
             out=sample(n,X_w,log_prior,w=w,sigma=sigma,M=args.M,steps=args.steps,start_t=args.start_t,generator=generator)
@@ -212,6 +224,7 @@ def main(args):
         return best/scale
 
     results=[]
+    ceiling=None
     for p,prompt in enumerate(prompts):
         name=re.sub(r"[^A-Za-z0-9]+","_",prompt).strip("_")[:60]
         retrieved=to_pil(bank_to_pixels(bank,X[top_idx[p][:1].to(X.device)],vae))[0]
@@ -261,13 +274,36 @@ def main(args):
         # FID/KID over fid_samples samples per w, split evenly across prompts, against held-out images
         # (embed.py --holdout) and against training images; "vs train" much lower than "vs test" means copying
         ref_gen=torch.Generator().manual_seed(args.seed)
-        refs={"train":X[torch.randperm(X.shape[0],generator=ref_gen)[:args.fid_ref_size].to(X.device)].float()}
-        if bank.get("X_test") is not None and bank["X_test"].shape[0]>0:
+        ref_idx=torch.randperm(X.shape[0],generator=ref_gen)[:args.fid_ref_size]
+        refs={"train":X[ref_idx.to(X.device)].float()}
+        has_test=bank.get("X_test") is not None and bank["X_test"].shape[0]>0
+        if has_test:
             refs["test"]=bank["X_test"][:args.fid_ref_size].float()
         else:
             print("warning: bank has no held-out images (embed.py --holdout), FID is only against training images")
         kid_subset=min(args.kid_subset,args.fid_samples)
-        ref_metrics={k:ReferenceMetrics(bank_to_pixels(bank,v,vae).to(device),device,kid_subset,pr_k=args.pr_k) for k,v in refs.items()}
+        ref_pixels={k:bank_to_pixels(bank,v,vae) for k,v in refs.items()}
+        if has_test and bank["space"]!="pixel":
+            # the decoded X_test are the autoencoder's reconstructions; "real" is the held-out images themselves,
+            # the only references comparable across spaces
+            ref_pixels["real"]=held_out_pixels(bank,args.fid_ref_size)
+        ref_metrics={k:ReferenceMetrics(v.to(device),device,kid_subset,pr_k=args.pr_k) for k,v in ref_pixels.items()}
+        # the ceiling: fid_samples decoded training images (none of them in the "train" references), scored like
+        # samples; a perfect sampler of the bank's distribution gets about this
+        rest=torch.randperm(X.shape[0],generator=ref_gen)
+        rest=rest[~torch.isin(rest,ref_idx)][:args.fid_samples]
+        if rest.numel()<kid_subset:
+            print(f"warning: only {rest.numel()} training images outside the references, no FID ceiling")
+        else:
+            ceiling={"n":rest.numel()}
+            for k,m in ref_metrics.items():
+                m.reset()
+                for i in range(0,rest.numel(),args.fid_batch):
+                    m.update(bank_to_pixels(bank,X[rest[i:i+args.fid_batch].to(X.device)].float(),vae).to(device))
+                ceiling.update({f"{name_}_{k}":v for name_,v in m.compute().items()})
+            print("ceiling (decoded training images)",ceiling)
+            if not args.no_wandb:
+                wandb.log({f"ceiling/{k}":v for k,v in ceiling.items()})
         dino=None
         if args.dino_model:
             dino=DinoCopy(args.dino_model,device)
@@ -317,7 +353,7 @@ def main(args):
                 wandb.log({f"fid/w={w}/{k}":v for k,v in metrics.items() if k not in ["prompt","w"]})
 
     with open(os.path.join(args.output_dir,"metrics.json"),"w") as f:
-        json.dump({"args":vars(args),"prompts":prompts,"results":results},f,indent=4)
+        json.dump({"args":vars(args),"prompts":prompts,"results":results,"ceiling":ceiling},f,indent=4)
     print(f"saved grids and metrics to {args.output_dir}")
     if not args.no_wandb:
         wandb.finish()

@@ -13,7 +13,8 @@
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
 # usage: python scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement|summarize [setting ...]
 # (sample = sample_closed + sample_nets); sample_closed only needs build, sample_nets and agreement need train
-# sample_closed: the whole-image CFDM on the prompt's top-K CLIP matches, and each pyramid variant (pyramid_variants)
+# sample_closed: the retrieval baseline, the whole-image CFDM on the prompt's top-K CLIP matches, and each pyramid
+# variant (pyramid_variants)
 # make the log dirs first: mkdir -p slurm_chip/embed slurm_chip/caption slurm_chip/tokens slurm_chip/train slurm_chip/sample slurm_chip/agreement
 # FID/KID need torch-fidelity in the cluster env: pip install torch-fidelity
 # SHARPEN=1 python scripts/gen_experiments.py sample_closed ...: the sample runs again into outputs/<run>_sharp with
@@ -79,12 +80,15 @@ metrics="--n_per_prompt 4 --fid_samples 500 --kid_subset 100 --fid_ref_size 2000
 # the CFDM (whole image, or the pyramid's coarsest level) runs over the prompt's top-1000 CLIP matches
 cfdm_flags="--top_k 1000 --steps 50 --sigma 0.25 --start_t 0.2"
 # pyramid runs: no heatmap; heatmap bonus only; hard filter to the top quarter (expected to tile the prompt's
-# regions everywhere); top quarter plus a random quarter of the rest; and that filter plus the bonus
+# regions everywhere); top quarter plus a random quarter of the rest; that filter with patches kept only when at
+# least half their pixels are in kept tokens (any overlapping pixel otherwise keeps most patches); and the
+# filter plus the bonus
 pyramid_variants={
     "pyramid":"",
     "pyramid_hm":"--heatmap_lambda 1",
     "pyramid_strict":"--heatmap_keep 0.25",
     "pyramid_keep":"--heatmap_keep 0.25 --heatmap_random 0.25",
+    "pyramid_keep_half":"--heatmap_keep 0.25 --heatmap_random 0.25 --heatmap_overlap 0.5",
     "pyramid_keep_hm":"--heatmap_keep 0.25 --heatmap_random 0.25 --heatmap_lambda 1",
 }
 # fine-tuning starts from the checkpoint (lower lr); scratch training from random init
@@ -166,7 +170,8 @@ for name in settings:
             print(sbatch(f"{kind}_{name}",f"train/{name}_{kind}",f"finetune.py --bank {bank} --base {cfg['base']} --name {name}_{kind} {flags} {size} {cfg['train']}",
                          script=cfg.get("train_script","runpygpu_chip.sh")))
     if stage in ["sample","sample_closed","all"]:
-        runs={}
+        # the baseline: training images drawn from the prompt's top matches (what sigma -> 0 collapses to)
+        runs={"retrieval":"--method retrieval --top_k 1000"}
         if cfg.get("cfdm",True):
             runs["cfdm"]=f"--method cfdm {cfdm_flags}"
         for variant,flags in pyramid_variants.items():

@@ -11,7 +11,8 @@ own detail band and takes its low frequencies from the finished coarser level (t
 blend), so the patches can sharpen the CFDM layout but never move it. Each candidate patch can carry a bias:
 w * log p(parent image | prompt), plus heatmap_lambda * its standardized CLIP text-heatmap score (the
 overlap-weighted mean of the heat of the tokens it covers), and the bank can be cut to the patches that overlap
-the most text-relevant tokens, plus a random share of the rest.
+the most text-relevant tokens (by any pixel, or by at least a set fraction of the patch), plus a random share of
+the rest.
 
 Same time convention as cfdm.py: z_t = t x + (1-t) eps, t=0 is noise and t=1 is clean.
 '''
@@ -80,14 +81,16 @@ def token_to_patches(token:torch.Tensor,size:tuple,p:int)->torch.Tensor:
 
 
 def build_patch_bank(images:torch.Tensor,p:int,log_prior:torch.Tensor=None,w:float=1.0,heat:torch.Tensor=None,
-                     heatmap_lambda:float=0.0,keep:float=1.0,random_frac:float=0.0,generator:torch.Generator=None)->dict:
+                     heatmap_lambda:float=0.0,keep:float=1.0,random_frac:float=0.0,generator:torch.Generator=None,
+                     min_overlap:float=0.0)->dict:
     '''
     every stride-1 p x p patch of images (K,C,H,W), each with an additive logit bias
         w * log_prior[parent] + heatmap_lambda * standardized heat score
     heat: (K,g,g) text heatmap on each image's CLIP token grid; a patch's score is the overlap-weighted mean
     heat of the tokens it covers (token_to_patches)
     keep < 1 keeps that fraction of the tokens, those with the highest heat over all K images, and then every
-    patch that shares at least one pixel with a kept token, plus random_frac of the other patches (patches the
+    patch with more than min_overlap of its pixels inside kept tokens (0: a single pixel is enough; 0.5: at least
+    half the patch), plus random_frac of the other patches (patches the
     text heatmap calls irrelevant still have to be available: every output region snaps to some patch, so a bank
     of only relevant patches tiles them everywhere)
     returns {patches (M,C*p*p), bias (M,) or None, y_sq (M,), n_total}
@@ -109,7 +112,11 @@ def build_patch_bank(images:torch.Tensor,p:int,log_prior:torch.Tensor=None,w:flo
         flat=heat.to(patches).flatten()
         kept_tokens=torch.zeros_like(flat)
         kept_tokens[torch.topk(flat,max(1,math.ceil(keep*flat.numel()))).indices]=1
-        covered=token_to_patches(kept_tokens.reshape(heat.shape),size,p).flatten()>1e-6
+        # the fraction of each patch's pixels inside kept tokens
+        covered_frac=token_to_patches(kept_tokens.reshape(heat.shape),size,p).flatten()
+        # capped at the best-covered patch: at coarse levels, where patches span several tokens, no patch may
+        # reach min_overlap, and an empty level can't denoise anything
+        covered=covered_frac>1e-6 if min_overlap<=0 else covered_frac>=min(min_overlap,covered_frac.max().item())-1e-6
         rest=(~covered).nonzero().squeeze(1)
         n_rand=int(round(random_frac*rest.numel()))
         perm=torch.randperm(rest.numel(),generator=generator,device=generator.device if generator is not None else "cpu")
@@ -189,7 +196,7 @@ def sample_level(n:int,bank:dict,shape:tuple,p:int,coarser:torch.Tensor,steps:in
 
 def build_pyramid_banks(images:torch.Tensor,coarse_size:int,p:int,log_prior:torch.Tensor=None,w:float=1.0,
                         heat:torch.Tensor=None,heatmap_lambda:float=0.0,keep:float=1.0,random_frac:float=0.0,
-                        generator:torch.Generator=None)->list:
+                        generator:torch.Generator=None,min_overlap:float=0.0)->list:
     '''
     one patch bank per patch level (every level but the coarsest), finest first
     images: (K,C,H,W) the images supplying patches, heat: (K,g,g) on their CLIP token grids or None; the same
@@ -199,7 +206,7 @@ def build_pyramid_banks(images:torch.Tensor,coarse_size:int,p:int,log_prior:torc
     banks=[]
     for size in sizes[:-1]:
         assert min(size)>=p,f"patch_size {p} is larger than the {size[0]}x{size[1]} level"
-        banks.append(build_patch_bank(resize(images,size),p,log_prior,w,heat,heatmap_lambda,keep,random_frac,generator))
+        banks.append(build_patch_bank(resize(images,size),p,log_prior,w,heat,heatmap_lambda,keep,random_frac,generator,min_overlap))
     return banks
 
 

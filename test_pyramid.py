@@ -64,6 +64,28 @@ def test_heatmap_filter_keeps_patches_overlapping_kept_tokens(images):
     assert mixed["patches"].shape[0]==covered.sum()+round(0.5*(M-covered.sum().item()))
 
 
+def test_heatmap_filter_min_overlap(images):
+    x,g=images
+    heat=torch.rand(4,4,4,generator=g)
+    kept=torch.zeros(64)
+    kept[torch.topk(heat.flatten(),16).indices]=1
+    painted=kept.reshape(4,1,4,4).repeat_interleave(4,2).repeat_interleave(4,3)
+    # the fraction of each 5x5 patch's pixels inside kept tokens
+    frac=F.unfold(painted,5).mean(1).flatten()
+    for min_overlap in [0.25,0.5]:
+        bank=build_patch_bank(x,5,heat=heat,keep=0.25,min_overlap=min_overlap)
+        assert bank["patches"].shape[0]==(frac>=min_overlap-1e-6).sum()>0
+    # stricter than any overlapping pixel
+    assert (frac>=0.5).sum()<(frac>0).sum()
+    # never empty: an unreachable threshold falls back to the best-covered patches
+    one=torch.zeros(64)
+    one[0]=1
+    bank=build_patch_bank(x,5,heat=one.reshape(4,4,4),keep=1/64,min_overlap=1.0)
+    painted=one.reshape(4,1,4,4).repeat_interleave(4,2).repeat_interleave(4,3)
+    frac=F.unfold(painted,5).mean(1).flatten()
+    assert bank["patches"].shape[0]==(frac>=frac.max()-1e-6).sum()>0
+
+
 def test_heatmap_lambda_standardizes(images):
     x,g=images
     heat=torch.rand(4,4,4,generator=g)*100+7
