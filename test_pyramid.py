@@ -157,3 +157,52 @@ def test_sample_pyramid_mixes_images(images):
     nearest=torch.cdist(q,banks[0]["patches"]).min(-1).values
     noise=torch.cdist(torch.randn(200,75,generator=g),banks[0]["patches"]).min(-1).values
     assert nearest.mean()<0.25*noise.mean()
+
+
+def test_attribution_is_exact(images):
+    x,g=images
+    p=5
+    bank=build_patch_bank(x,p,keep=1.0)
+    M=bank["patches"].shape[0]
+    z=torch.randn(2,3,16,16,generator=g)
+    window=gaussian_window(3,p,0.3)
+    out,attr=image_denoise(z,bank,0.7,p,window,return_attribution=True,topk=M,n_sources=M*p*p)
+    assert torch.allclose(out,image_denoise(z,bank,0.7,p,window),atol=1e-6)
+    # per-pixel shares of the patch images sum to 1
+    assert attr["maps"].shape==(2,4,16,16) and torch.allclose(attr["maps"].sum(1),torch.ones(2,16,16),atol=1e-5)
+    # with every bank patch kept, the source pixels rebuild each output pixel exactly
+    s=attr["sources"]
+    valid=s["image"]>=0
+    src=x[s["image"].clamp_min(0),:,s["y"],s["x"]]*(s["weight"]*valid)[...,None]
+    assert torch.allclose(src.sum(3).permute(0,3,1,2),out,atol=1e-4)
+    assert torch.allclose(s["weight"].sum(-1),torch.ones(2,16,16),atol=1e-4)
+    # and aggregate to the per-image maps
+    per_image=torch.zeros(2,16,16,4).scatter_add_(3,s["image"].clamp_min(0),s["weight"]*valid)
+    assert torch.allclose(per_image.permute(0,3,1,2),attr["maps"],atol=1e-4)
+
+
+def test_attribution_sources_find_a_copied_region():
+    # a query that is exactly training image 2 at t near 1: every pixel's top source is its own pixel there
+    g=torch.Generator().manual_seed(3)
+    x=resize(torch.randn(3,3,6,6,generator=g),(12,12))
+    p=3
+    bank=build_patch_bank(x,p)
+    _,attr=image_denoise(x[2:3],bank,0.999,p,gaussian_window(3,p,0.3),return_attribution=True)
+    s=attr["sources"]
+    ys,xs=torch.meshgrid(torch.arange(12),torch.arange(12),indexing="ij")
+    assert (s["image"][0,:,:,0]==2).all() and torch.equal(s["y"][0,:,:,0],ys) and torch.equal(s["x"][0,:,:,0],xs)
+    assert (s["weight"][0,:,:,0]>0.99).all()
+
+
+def test_sample_pyramid_attribution(images):
+    x,g=images
+    banks=build_pyramid_banks(x,8,5)
+    coarse=downsample_flat(x.flatten(1),(3,16,16),(8,8),"cpu")
+    out,attr=sample_pyramid(3,coarse,(3,16,16),banks,8,5,sigma=0.1,M=2,cfdm_steps=5,steps=3,
+                            generator=torch.Generator().manual_seed(0),return_attribution=True)
+    assert out.shape==(3,768) and attr["layout"].shape==(3,4)
+    assert torch.allclose(attr["layout"].sum(-1),torch.ones(3),atol=1e-5)
+    assert attr["content"]["maps"].shape==(3,4,16,16)
+    # same samples with or without attribution
+    plain=sample_pyramid(3,coarse,(3,16,16),banks,8,5,sigma=0.1,M=2,cfdm_steps=5,steps=3,generator=torch.Generator().manual_seed(0))
+    assert torch.allclose(out,plain,atol=1e-6)

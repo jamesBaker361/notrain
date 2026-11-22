@@ -61,3 +61,22 @@ def test_net_sample_unconditional():
     model=TextUNet(in_channels=3,sample_size=8,block_out_channels=(16,32),layers_per_block=1,text_dim=1,norm_num_groups=8)
     out=net_sample(model,torch.randn(2,3,8,8),steps=3)
     assert out.shape==(2,3,8,8) and torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("n",[10,60])
+def test_frechet_distance_matches_sqrtm(n):
+    # both branches (fewer samples than dims, and more) against scipy's matrix square root
+    import numpy as np
+    from scipy import linalg
+    from metrics import _gaussian,frechet_distance,bootstrap_fid_std
+    g=torch.Generator().manual_seed(0)
+    real=torch.randn(80,20,generator=g)@torch.randn(20,20,generator=g)
+    fake=torch.randn(n,20,generator=g)*1.5+0.3
+    mu1,cov1=_gaussian(real)
+    mu2,cov2=_gaussian(fake)
+    vals,vecs=torch.linalg.eigh(cov1)
+    cov1_sqrt=vecs@torch.diag(vals.clamp_min(0).sqrt())@vecs.T
+    covmean=linalg.sqrtm(cov1.numpy()@cov2.numpy()).real
+    expected=((mu1-mu2)**2).sum().item()+np.trace(cov1.numpy())+np.trace(cov2.numpy())-2*np.trace(covmean)
+    assert abs(frechet_distance(mu1,cov1_sqrt,cov1,fake)-expected)<1e-6*max(1,abs(expected))
+    assert bootstrap_fid_std(real,fake,n_boot=10)>0

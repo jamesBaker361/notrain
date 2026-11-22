@@ -10,6 +10,9 @@ each output row is: [top CLIP-retrieved training image | samples...] for one (pr
 --method net: a trained diffusion model
 --method retrieval: the baseline every closed-form sampler has to beat, training images drawn from the w-sharpened
     prior over the top-k CLIP matches (uniformly at w=0), i.e. the CFDM's sigma -> 0, exact-score limit
+--method ls: Kamb & Ganguli's local score machine over the top-k matches (els.py)
+--method pyramid --pyramid_upsample: the ablation without patch levels (the CFDM layout, bicubic-upsampled)
+the closed-form samplers live in samplers.py, shared with attribution.py
 with --fid_samples, a latent bank's samples are also scored against the real held-out images ("_real"), and every
 run records the FID "ceiling": decoded training images scored like samples (an autoencoder's reconstruction limit
 in latent spaces, the finite-sample floor in pixel space)
@@ -24,10 +27,10 @@ import wandb
 import numpy as np
 from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
-from cfdm import text_log_prior,top_k_subset,sample,median_distance
-from pyramid import pyramid_sizes,downsample_flat,build_pyramid_banks,sample_pyramid
-from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask,tokens_path,held_out_pixels
-from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,prompt_accuracy
+from cfdm import text_log_prior,median_distance
+from samplers import METHODS,ClosedForm,add_sampler_args
+from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask,held_out_pixels
+from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,ItmScore,prompt_accuracy
 
 parser=argparse.ArgumentParser()
 parser.add_argument("--bank",type=str,default="banks/celeb_vae_256.pt")
@@ -35,26 +38,8 @@ parser.add_argument("--prompt_file",type=str,default="prompts/faces.txt",help="o
 parser.add_argument("--prompts",type=str,nargs="+",default=None,help="overrides --prompt_file")
 parser.add_argument("--n_per_prompt",type=int,default=8)
 parser.add_argument("--w",type=float,nargs="+",default=[0.0,1.0,4.0],help="text guidance weights to sweep; 0=unconditional, 1=exact conditional")
-parser.add_argument("--method",type=str,default="cfdm",choices=["cfdm","pyramid","net","retrieval"],help="cfdm: smoothed CFDM at full resolution; pyramid: CFDM at --coarse_size, then closed-form patch levels; net: a trained diffusion model (--model); retrieval: training images drawn from the prompt's top-k CLIP matches")
-parser.add_argument("--sigma",type=float,default=0.25,help="CFDM smoothing, as a fraction of the median pairwise distance between bank points (at the coarsest level for --method pyramid); 0 reproduces training points exactly")
-parser.add_argument("--M",type=int,default=4,help="noise samples per smoothed score evaluation")
-parser.add_argument("--steps",type=int,default=50,help="CFDM Euler steps (and the net's sampling steps)")
-parser.add_argument("--start_t",type=float,default=0.2,help="CFDM starts from the exact mixture at this t (0 = pure noise)")
-parser.add_argument("--top_k",type=int,default=1000,help="restrict the CFDM to the top-k CLIP matches per prompt (<=0 for all); w=0 always uses the full bank")
-parser.add_argument("--coarse_size",type=int,default=16,help="pyramid: short side of the coarsest level, where the CFDM runs; levels halve from full resolution down to it")
-parser.add_argument("--patch_size",type=int,default=7,help="pyramid: side of the square patches at every patch level")
-parser.add_argument("--patch_images",type=int,default=50,help="pyramid: images supplying patches, the best CLIP matches (w=0: uniformly random ones); cost grows linearly with it")
-parser.add_argument("--pyramid_steps",type=int,default=10,help="pyramid: denoising steps per patch level")
-parser.add_argument("--fold_rho",type=float,default=0.2,help="pyramid: width of the Gaussian window overlapping patch estimates are averaged with")
-parser.add_argument("--eta",type=float,default=0.0,help="pyramid: patch-level stochasticity in [0,1] (0 = deterministic DDIM)")
-parser.add_argument("--heatmap_lambda",type=float,default=0.0,help="pyramid: logit bonus per standard deviation of a patch's CLIP text-heatmap score (0 = off)")
-parser.add_argument("--heatmap_keep",type=float,default=1.0,help="pyramid: keep this fraction of CLIP tokens, those with the highest heat over the patch images, and every patch overlapping a kept token (1 = all)")
-parser.add_argument("--heatmap_overlap",type=float,default=0.0,help="pyramid: with --heatmap_keep < 1, the fraction of a patch's pixels that must lie inside kept tokens for it to be kept (0 = any pixel, 0.5 = at least half)")
-parser.add_argument("--heatmap_random",type=float,default=0.0,help="pyramid: with --heatmap_keep < 1, also keep this random fraction of the other patches")
-parser.add_argument("--tokens",type=str,default="",help="pyramid heatmaps: the bank's CLIP token embeddings from clip_tokens.py; defaults to <bank>_tokens.pt")
-parser.add_argument("--heatmap_baseline",type=str,nargs="+",default=["a photo.","an image.","a picture."],help="pyramid: generic texts whose heatmaps, with the other prompts', are averaged and subtracted")
+parser.add_argument("--method",type=str,default="cfdm",choices=METHODS+["net"],help="cfdm: smoothed CFDM at full resolution; pyramid: CFDM at --coarse_size, then closed-form patch levels; net: a trained diffusion model (--model); retrieval: training images drawn from the prompt's top-k CLIP matches; ls: the local score machine (samplers.py)")
 parser.add_argument("--model",type=str,default="",help="--method net: 'pretrained:<repo>' (e.g. pretrained:google/ddpm-cifar10-32, as-is), a finetune.py path prefix (cross-attention models use the prompt with w as the CFG scale), or an --unconditional train.py prefix")
-parser.add_argument("--bank_device",type=str,default="auto",choices=["auto","cpu","cuda"],help="where the bank lives; auto keeps banks over 4GB (e.g. 256px pixels) in CPU memory and moves only what's needed")
 parser.add_argument("--fid_samples",type=int,default=0,help="if > 0, generate this many extra samples per w (split across prompts) for FID/KID")
 parser.add_argument("--fid_ref_size",type=int,default=2000,help="reference images for FID/KID: held-out (X_test) and a random training subset")
 parser.add_argument("--kid_subset",type=int,default=100,help="KID subset size (capped at --fid_samples)")
@@ -64,14 +49,15 @@ parser.add_argument("--dino_model",type=str,default="facebook/dinov2-small",help
 parser.add_argument("--dino_copy_threshold",type=float,default=0.95,help="DINO cosine similarity to the nearest training image above which a sample counts as a copy")
 parser.add_argument("--lpips_net",type=str,default="alex",help="LPIPS backbone for perceptual diversity: alex (the standard), vgg or squeeze ('' disables)")
 parser.add_argument("--copy_threshold",type=float,default=1e-2,help="relative distance below which a sample counts as a training copy")
+parser.add_argument("--itm_model",type=str,default="",help="BLIP image-text matching model for itm_score, a text-alignment metric outside the CLIP family (e.g. Salesforce/blip-itm-base-coco; '' disables)")
 parser.add_argument("--eval_clip_model",type=str,default="",help="CLIP used for the clip_score metric; defaults to the conditioning CLIP (biased)")
 parser.add_argument("--unsharp_amount",type=float,default=0.0,help="if > 0, also show the samples after an unsharp mask of this strength (e.g. 1.0) under the originals in the grids and wandb; metrics use the originals")
 parser.add_argument("--unsharp_radius",type=float,default=1.0,help="unsharp mask Gaussian sigma in pixels (e.g. 1 at 64px, 2-3 at 256px)")
 parser.add_argument("--unsharp_threshold",type=float,default=0.0,help="unsharp mask: only sharpen where the detail exceeds this (in [0,1] intensity units)")
-parser.add_argument("--seed",type=int,default=123)
 parser.add_argument("--output_dir",type=str,default="outputs")
 parser.add_argument("--project_name",type=str,default="notrain")
 parser.add_argument("--no_wandb",action="store_true")
+add_sampler_args(parser)
 
 
 def main(args):
@@ -84,8 +70,6 @@ def main(args):
         bank_device=device
     X=bank["X"].to(bank_device)
     T=bank["T"].to(device)
-    if X.device!=torch.device(device) and args.method=="cfdm":
-        raise ValueError("whole-bank cfdm needs the bank on the GPU; use --method pyramid or --bank_device cuda")
     shape=bank["shape"]
     print(f"bank {args.bank}: X {tuple(X.shape)} T {tuple(T.shape)} space {bank['space']} shape {shape}")
 
@@ -116,70 +100,19 @@ def main(args):
         net=TrainedNet(args.model,device,lambda texts:encode_texts_clip_tokens(clip_model,clip_processor,texts,device))
         print(f"trained net {args.model}: {'text-conditional (w = CFG scale)' if net.conditional else 'unconditional (prompts and w ignored)'}, starting at t={net.t_min:.4f}")
     lpips_metric=LpipsDiversity(device,args.lpips_net) if args.lpips_net else None
+    itm=ItmScore(args.itm_model,device) if args.itm_model else None
 
-    # typical distance between bank points: sets the smoothing and normalizes the copy metric
-    generator=torch.Generator(device=device).manual_seed(args.seed)
-    scale=median_distance(X,generator=generator)
-    sigma=args.sigma*scale
-    if args.method=="pyramid":
-        # the whole bank at the coarsest level, once: the CFDM runs there, and its smoothing is set there
-        sizes=pyramid_sizes(shape[1],shape[2],args.coarse_size)
-        coarse_shape=(shape[0],*sizes[-1])
-        X_coarse=downsample_flat(X,shape,sizes[-1],device)
-        sigma=args.sigma*median_distance(X_coarse,generator=generator)
-        print(f"pyramid levels {sizes} (CFDM at {sizes[-1]}, {args.patch_size}x{args.patch_size} patches above)")
-        heatmap_on=args.heatmap_lambda!=0 or args.heatmap_keep<1
-        if heatmap_on:
-            # every prompt's heatmaps, minus their mean over all prompts and the generic baseline texts
-            heat_texts=torch.cat([text_embeds,encode_texts_clip(clip_model,clip_processor,args.heatmap_baseline,device)])
-            path=args.tokens or tokens_path(args.bank)
-            assert os.path.exists(path),f"heatmaps need the bank's CLIP token embeddings: run clip_tokens.py --bank {args.bank} (missing {path})"
-            # memory-mapped: only the patch images' rows are read
-            bank_tokens=torch.load(path,weights_only=False,mmap=True)
-            # possibly shared with banks of the same images in other spaces: the rows must be the same images, in
-            # order, which their CLIP image embeddings show (up to the precision each bank was embedded in)
-            assert bank_tokens["clip_model"]==bank["clip_model"] and bank_tokens["tokens"].shape[0]==X.shape[0],\
-                f"{path} doesn't match the bank ({bank_tokens['clip_model']}, {bank_tokens['tokens'].shape[0]} rows)"
-            same=(bank_tokens["T"].float().to(device)*T).sum(-1).min().item()
-            assert same>0.98,f"{path} was built from different images than {args.bank} (min CLIP cosine {same:.3f})"
-            print(f"CLIP tokens {tuple(bank_tokens['tokens'].shape)} from {path} (last {bank_tokens['n_layers']} layers)")
-        pyramid_banks={}
-    print(f"median pairwise distance {scale:.4f}, sigma {sigma:.4f}")
+    if args.method=="net":
+        # typical distance between bank points: normalizes the copy metric
+        generator=torch.Generator(device=device).manual_seed(args.seed)
+        scale=median_distance(X,generator=generator)
+    else:
+        sampler=ClosedForm(args,bank,X,T,log_priors,text_embeds,clip_model,clip_processor,device)
+        scale=sampler.scale
 
     os.makedirs(args.output_dir,exist_ok=True)
-    # best CLIP matches per prompt (for the retrieved image shown in each row); the subset itself is only built when used
-    top_idx={p:torch.topk(log_priors[p],min(max(args.top_k,args.patch_images if args.method=="pyramid" else 1,1),X.shape[0])).indices for p in range(len(prompts))}
-
-    def patch_banks(p:int,w:float):
-        '''
-        the pyramid's patch banks for prompt p at weight w, built once and reused (e.g. across FID batches)
-        '''
-        if (p,w) in pyramid_banks:
-            return pyramid_banks[(p,w)]
-        if w==0:
-            # unconditional: random images, no text prior or heatmap (the CLIP matches would themselves be conditioning)
-            idx=torch.randperm(X.shape[0],generator=torch.Generator().manual_seed(args.seed+p))[:args.patch_images]
-            prior,heat=None,None
-        else:
-            idx=top_idx[p][:args.patch_images].cpu()
-            prior=log_priors[p][idx.to(device)]
-            heat=None
-            if heatmap_on:
-                # (K,g,g,texts) heatmaps on the patch images' token grids; pyramid.py maps each token to the
-                # patches overlapping it at every level
-                maps=bank_tokens["tokens"][idx].to(device).float()@heat_texts.T
-                heat=maps[...,p]-maps.mean(-1)
-        images=X[idx.to(X.device)].to(device).float().reshape(-1,*shape)
-        # no heatmap (w=0) means no filtering either
-        keep=args.heatmap_keep if heat is not None else 1.0
-        banks=build_pyramid_banks(images,args.coarse_size,args.patch_size,prior,w,heat,args.heatmap_lambda,
-                                  keep,args.heatmap_random,generator,args.heatmap_overlap)
-        info={"patches_per_level":[b["patches"].shape[0] for b in banks],
-              # no patch levels when --coarse_size is the full resolution: the CFDM alone
-              "patches_kept":sum(b["patches"].shape[0] for b in banks)/max(sum(b["n_total"] for b in banks),1)}
-        print(f"prompt {p} w={w}: patch banks {info}")
-        pyramid_banks[(p,w)]=(banks,info)
-        return banks,info
+    # best CLIP match per prompt, for the retrieved image shown in each row
+    top_idx={p:torch.topk(log_priors[p],1).indices for p in range(len(prompts))}
 
     def generate(p:int,w:float,n:int):
         '''
@@ -188,31 +121,7 @@ def main(args):
         if args.method=="net":
             z0=torch.randn((n,*shape),generator=generator,device=device)
             return net.sample(z0,args.steps,net.t_min,prompts[p],w).flatten(1),None,{}
-        if w==0:
-            # unconditional baseline: the top-k subset would itself be text conditioning
-            sub,log_prior,prior_mass=None,None,1.0
-        else:
-            _,log_prior,sub=top_k_subset(T,log_priors[p],args.top_k)
-            # fraction of the w-sharpened prior that the top-k subset keeps
-            prior_mass=torch.softmax(w*log_priors[p],dim=-1)[sub].sum().item()
-            if prior_mass<0.9:
-                print(f"warning: top_k={args.top_k} keeps only {prior_mass:.3f} of the prior mass for '{prompts[p]}' at w={w}")
-        if args.method=="retrieval":
-            if sub is None:
-                idx=torch.randint(X.shape[0],(n,),generator=generator,device=device)
-            else:
-                idx=sub[torch.multinomial(torch.softmax(w*log_prior,dim=-1),n,replacement=True,generator=generator)]
-            return X[idx.to(X.device)].to(device).float(),prior_mass,{}
-        if args.method=="cfdm":
-            X_w=X if sub is None else X[sub]
-            out=sample(n,X_w,log_prior,w=w,sigma=sigma,M=args.M,steps=args.steps,start_t=args.start_t,generator=generator)
-            return out,prior_mass,{}
-        banks,info=patch_banks(p,w)
-        coarse=X_coarse if sub is None else X_coarse[sub]
-        out=sample_pyramid(n,coarse,shape,banks,args.coarse_size,args.patch_size,log_prior,w=w,sigma=sigma,M=args.M,
-                           cfdm_steps=args.steps,start_t=args.start_t,steps=args.pyramid_steps,rho=args.fold_rho,
-                           eta=args.eta,generator=generator)
-        return out,prior_mass,info
+        return sampler.generate(p,w,n)[:3]
 
     def nearest_train(out:torch.Tensor)->torch.Tensor:
         # distance to the closest training point, relative to the typical pairwise distance; streams the bank
@@ -253,6 +162,7 @@ def main(args):
                 # perceptual version of the same, and whether an independent CLIP picks this prompt among all prompts
                 "lpips_diversity":lpips_metric.mean_pairwise(pixels) if lpips_metric else None,
                 "prompt_accuracy":prompt_accuracy(image_embeds,eval_text_embeds,torch.full((out.shape[0],),p)),
+                "itm_score":float(itm.score(images,[prompt]*len(images)).mean()) if itm else None,
                 # the first call includes building the pyramid's patch banks
                 "seconds_per_sample":elapsed/args.n_per_prompt,
                 **info
@@ -340,6 +250,9 @@ def main(args):
                 sims=dino.nearest_similarity(all_pixels)
                 metrics["dino_nn_sim"]=float(sims.mean())
                 metrics["dino_copy_rate"]=float((sims>=args.dino_copy_threshold).float().mean())
+            if itm is not None:
+                metrics["fid_itm_score"]=float(torch.cat([itm.score(to_pil(all_pixels[i:i+64]),[prompts[j] for j in prompt_ids[i:i+64].tolist()])
+                                                          for i in range(0,all_pixels.shape[0],64)]).mean())
             if lpips_metric is not None:
                 per=[lpips_metric.mean_pairwise(all_pixels[prompt_ids==p]) for p in range(len(prompts))]
                 per=[v for v in per if v is not None]

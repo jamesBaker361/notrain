@@ -14,6 +14,13 @@ overlap-weighted mean of the heat of the tokens it covers), and the bank can be 
 the most text-relevant tokens (by any pixel, or by at least a set fraction of the patch), plus a random share of
 the rest.
 
+Every output is an exact convex combination of training data, which is what makes it attributable: the coarse
+CFDM sample is sum_i w_i x_i (cfdm.sample), and the finest level's last step is a window-weighted fold of
+softmax averages of training patches, so each output pixel is exactly a weighted sum of training pixels: of the
+pixel at the same offset inside every source patch of every query patch covering it. return_attribution gives,
+at the finest level, each pixel's exact share from each patch image, its top source pixels (image, y, x, weight;
+pixel_sources), and the CFDM weights behind the layout.
+
 Same time convention as cfdm.py: z_t = t x + (1-t) eps, t=0 is noise and t=1 is clean.
 '''
 import math
@@ -93,12 +100,15 @@ def build_patch_bank(images:torch.Tensor,p:int,log_prior:torch.Tensor=None,w:flo
     half the patch), plus random_frac of the other patches (patches the
     text heatmap calls irrelevant still have to be available: every output region snaps to some patch, so a bank
     of only relevant patches tiles them everywhere)
-    returns {patches (M,C*p*p), bias (M,) or None, y_sq (M,), n_total}
+    returns {patches (M,C*p*p), bias (M,) or None, y_sq (M,), parent (M,) the image each patch comes from,
+    pos (M,) its top-left corner as y*(W-p+1)+x, n_images K, n_total}
     '''
     K=images.shape[0]
     patches=F.unfold(images,p).transpose(1,2)
     L=patches.shape[1]
     patches=patches.reshape(K*L,-1)
+    parent=torch.arange(K,device=patches.device).repeat_interleave(L)
+    pos=torch.arange(L,device=patches.device).repeat(K)
     bias=None
     if log_prior is not None and w!=0:
         bias=w*log_prior.to(patches).repeat_interleave(L)
@@ -122,39 +132,120 @@ def build_patch_bank(images:torch.Tensor,p:int,log_prior:torch.Tensor=None,w:flo
         perm=torch.randperm(rest.numel(),generator=generator,device=generator.device if generator is not None else "cpu")
         idx=torch.cat([covered.nonzero().squeeze(1),rest[perm[:n_rand].to(rest.device)]])
         patches=patches[idx]
+        parent=parent[idx]
+        pos=pos[idx]
         bias=None if bias is None else bias[idx]
-    return {"patches":patches,"bias":bias,"y_sq":patches.pow(2).sum(-1),"n_total":K*L}
+    return {"patches":patches,"bias":bias,"y_sq":patches.pow(2).sum(-1),"parent":parent,"pos":pos,"n_images":K,"n_total":K*L}
 
 
-def patch_denoise(q:torch.Tensor,bank:dict,t:float,max_elements:int=2**27)->torch.Tensor:
+def patch_denoise(q:torch.Tensor,bank:dict,t:float,max_elements:int=2**27,return_attribution:bool=False,
+                  topk:int=8):
     '''
     closed-form denoiser over the patch bank: softmax_j( -||q - t y_j||^2 / (2(1-t)^2) + bias_j ) weighted mean
     of the clean patches y_j (the clean estimate, not t*y), in query chunks of at most max_elements logits
-    q: (Q,P) noisy patches -> (Q,P)
+    q: (Q,P) noisy patches -> (Q,P); return_attribution also returns {mass (Q,K): the softmax mass on each patch
+    image, top_weight/top_index (Q,topk): the largest softmax weights and their bank patches}
     '''
     Y,bias,y_sq=bank["patches"],bank["bias"],bank["y_sq"]
     chunk=max(1,max_elements//Y.shape[0])
     out=torch.empty_like(q)
+    if return_attribution:
+        topk=min(topk,Y.shape[0])
+        attr={"mass":torch.zeros(q.shape[0],bank["n_images"],device=q.device,dtype=q.dtype),
+              "top_weight":torch.empty(q.shape[0],topk,device=q.device,dtype=q.dtype),
+              "top_index":torch.empty(q.shape[0],topk,device=q.device,dtype=torch.long)}
     for i in range(0,q.shape[0],chunk):
         logits=(2*t*q[i:i+chunk]@Y.T-t*t*y_sq)/(2*(1-t)**2)
         if bias is not None:
             logits=logits+bias
-        out[i:i+chunk]=torch.softmax(logits,dim=-1)@Y
-    return out
+        weights=torch.softmax(logits,dim=-1)
+        out[i:i+chunk]=weights@Y
+        if return_attribution:
+            attr["mass"][i:i+chunk].index_add_(1,bank["parent"],weights)
+            top=torch.topk(weights,topk,dim=-1)
+            attr["top_weight"][i:i+chunk]=top.values
+            attr["top_index"][i:i+chunk]=top.indices
+    return (out,attr) if return_attribution else out
 
 
-def image_denoise(z:torch.Tensor,bank:dict,t:float,p:int,window:torch.Tensor,max_elements:int=2**27)->torch.Tensor:
+def pixel_sources(top_weight:torch.Tensor,top_index:torch.Tensor,bank:dict,size:tuple,p:int,spatial:torch.Tensor,
+                  n_sources:int=4)->dict:
+    '''
+    one image's top source pixels. Output pixel (y,x) is offset (dy,dx) of the query patch at (y-dy,x-dx), whose
+    estimate weights bank patch j by alpha_j, and that patch's pixel at the same offset is (pos_j + (dy,dx)) of its
+    parent image; so the pixel's weight on that source pixel is window(dy,dx) * alpha_j / sum of the windows over
+    the patches covering (y,x), summed over every way of reaching it (a copied region reaches one source pixel
+    from all p^2 patches). Exact up to each query patch keeping only its top bank patches
+    top_weight/top_index: (L,r) from patch_denoise, L the (H-p+1)*(W-p+1) query patches
+    returns {image, y, x: (H,W,n_sources) long source pixels (image -1: no source), weight (H,W,n_sources)}
+    '''
+    H,W=size
+    Hl,Wl=H-p+1,W-p+1
+    r=top_weight.shape[-1]
+    grid=lambda v:v.reshape(Hl,Wl,r).permute(2,0,1)
+    weight=grid(top_weight)
+    image=grid(bank["parent"][top_index])
+    pos=bank["pos"][top_index]
+    sy,sx=grid(pos//Wl),grid(pos%Wl)
+    weights,keys=[],[]
+    for dy in range(p):
+        for dx in range(p):
+            # shift the query-patch grid onto the pixels at offset (dy,dx) of each patch
+            pad=(dx,W-Wl-dx,dy,H-Hl-dy)
+            weights.append(F.pad(weight*spatial[dy*p+dx],pad))
+            keys.append(F.pad(image*(H*W)+(sy+dy)*W+(sx+dx),pad,value=-1))
+    den=sum(F.pad(torch.full((Hl,Wl),float(spatial[dy*p+dx]),device=weight.device),(dx,W-Wl-dx,dy,H-Hl-dy))
+            for dy in range(p) for dx in range(p))
+    weights=(torch.cat(weights)/den).reshape(-1,H*W).T
+    keys=torch.cat(keys).reshape(-1,H*W).T
+    # merge the candidates that reach the same source pixel: sort each pixel's keys and sum each run
+    keys,order=keys.sort(dim=1)
+    weights=weights.gather(1,order)
+    new=torch.ones_like(keys,dtype=torch.bool)
+    new[:,1:]=keys[:,1:]!=keys[:,:-1]
+    run=new.cumsum(1)-1
+    totals=torch.zeros_like(weights).scatter_add_(1,run,weights)
+    run_keys=torch.full_like(keys,-1).scatter_(1,run,keys)
+    top=torch.topk(totals,min(n_sources,totals.shape[1]),dim=1)
+    key=run_keys.gather(1,top.indices)
+    valid=(key>=0)&(top.values>0)
+    key=key.clamp_min(0)
+    out={"image":torch.where(valid,key//(H*W),-1),"y":(key%(H*W))//W,"x":key%W,"weight":top.values*valid}
+    return {k:v.reshape(H,W,-1) for k,v in out.items()}
+
+
+def image_denoise(z:torch.Tensor,bank:dict,t:float,p:int,window:torch.Tensor,max_elements:int=2**27,
+                  return_attribution:bool=False,topk:int=8,n_sources:int=4):
     '''
     z: (B,C,H,W) -> clean estimate (B,C,H,W): denoise every stride-1 patch, then fold the estimates back as a
     window-weighted average over the patches covering each pixel
+    return_attribution also returns {maps (B,K,H,W): each pixel's exact share from each patch image, the same
+    window-weighted fold of the patches' softmax mass per image (sums to 1 over K at every pixel); sources: each
+    pixel's top n_sources source pixels (pixel_sources), stacked over B}
     '''
     B,C,H,W=z.shape
     q=F.unfold(z,p).transpose(1,2)
     L=q.shape[1]
-    est=patch_denoise(q.reshape(B*L,-1),bank,t,max_elements).reshape(B,L,-1)*window
+    est=patch_denoise(q.reshape(B*L,-1),bank,t,max_elements,return_attribution,topk)
+    if return_attribution:
+        est,attr=est
+        mass=attr["mass"]
+    est=est.reshape(B,L,-1)*window
     num=F.fold(est.transpose(1,2),(H,W),p)
     den=F.fold(window[None,:,None].expand(1,-1,L),(H,W),p)
-    return num/den
+    if not return_attribution:
+        return num/den
+    # the window is the same p x p one on every channel
+    spatial=window[:p*p]
+    K=mass.shape[-1]
+    mass=mass.reshape(B,L,K)
+    # one sample at a time: the (K*p*p, L) fold input is large at 256px
+    maps=torch.stack([F.fold((mass[b].T[:,None,:]*spatial[None,:,None]).reshape(1,K*p*p,L),(H,W),p)[0]
+                      for b in range(B)])/den[:,:1]
+    top_weight,top_index=attr["top_weight"].reshape(B,L,-1),attr["top_index"].reshape(B,L,-1)
+    sources=[pixel_sources(top_weight[b],top_index[b],bank,(H,W),p,spatial,n_sources) for b in range(B)]
+    sources={k:torch.stack([s[k] for s in sources]) for k in sources[0]}
+    return num/den,{"maps":maps,"sources":sources}
 
 
 def blend(fine:torch.Tensor,coarser:torch.Tensor)->torch.Tensor:
@@ -168,21 +259,27 @@ def blend(fine:torch.Tensor,coarser:torch.Tensor)->torch.Tensor:
 
 @torch.no_grad()
 def sample_level(n:int,bank:dict,shape:tuple,p:int,coarser:torch.Tensor,steps:int=10,rho:float=0.2,eta:float=0.0,
-                 generator:torch.Generator=None,max_elements:int=2**27)->torch.Tensor:
+                 generator:torch.Generator=None,max_elements:int=2**27,return_attribution:bool=False,
+                 topk:int=8,n_sources:int=4):
     '''
     one patch level from pure noise, DDIM-style (eta=0 deterministic, eta=1 fresh noise every step), with the
     noise estimated before the blend and no blend on the last step (as in efficient-SID's uncond sampler)
     shape: (C,H,W) of this level, coarser: (n,C,h,w) finished level below -> (n,C,H,W)
+    the unblended last step makes the output exactly the patch fold, so return_attribution also returns its
+    attribution (image_denoise)
     '''
     device=bank["patches"].device
     window=gaussian_window(shape[0],p,rho).to(device)
     z=torch.randn((n,*shape),generator=generator,device=device)
     ts=torch.linspace(0.0,1.0,steps+1).tolist()
+    maps=None
     for t,t_next in zip(ts[:-1],ts[1:]):
-        x_hat=image_denoise(z,bank,t,p,window,max_elements)
         if t_next>=1.0:
-            z=x_hat
+            z=image_denoise(z,bank,t,p,window,max_elements,return_attribution,topk,n_sources)
+            if return_attribution:
+                z,maps=z
             break
+        x_hat=image_denoise(z,bank,t,p,window,max_elements)
         eps=(z-t*x_hat)/(1-t)
         x_hat=blend(x_hat,coarser)
         noise_scale=1-t_next
@@ -191,7 +288,7 @@ def sample_level(n:int,bank:dict,shape:tuple,p:int,coarser:torch.Tensor,steps:in
             z=t_next*x_hat+math.sqrt(1-eta**2)*noise_scale*eps+eta*noise_scale*fresh
         else:
             z=t_next*x_hat+noise_scale*eps
-    return z
+    return (z,maps) if return_attribution else z
 
 
 def build_pyramid_banks(images:torch.Tensor,coarse_size:int,p:int,log_prior:torch.Tensor=None,w:float=1.0,
@@ -213,21 +310,31 @@ def build_pyramid_banks(images:torch.Tensor,coarse_size:int,p:int,log_prior:torc
 @torch.no_grad()
 def sample_pyramid(n:int,coarse_X:torch.Tensor,shape:tuple,banks:list,coarse_size:int,p:int,log_prior:torch.Tensor=None,
                    w:float=1.0,sigma:float=0.0,M:int=1,cfdm_steps:int=50,start_t:float=0.0,steps:int=10,rho:float=0.2,
-                   eta:float=0.0,generator:torch.Generator=None,max_elements:int=2**27,return_levels:bool=False):
+                   eta:float=0.0,generator:torch.Generator=None,max_elements:int=2**27,return_levels:bool=False,
+                   return_attribution:bool=False,topk:int=8,n_sources:int=4):
     '''
     coarse_X: (N,C*hc*wc) bank points at the coarsest level (downsample_flat), with log_prior (N,) for the CFDM
     there; sigma is the absolute CFDM smoothing; shape: (C,H,W) at full resolution; banks: build_pyramid_banks
-    returns (n,C*H*W), and with return_levels also every finished level, coarsest first
+    returns (n,C*H*W), with return_levels also every finished level, coarsest first, and with return_attribution
+    also {"layout": (n,N) the CFDM's convex weights over coarse_X, "content": the finest level's image_denoise
+    attribution (per-pixel shares of the K patch images and top source pixels), or None without patch levels}
     '''
     C,H,W=shape
     sizes=pyramid_sizes(H,W,coarse_size)
     assert len(banks)==len(sizes)-1,f"{len(banks)} banks for {len(sizes)} levels"
-    x=sample(n,coarse_X,log_prior,w=w,sigma=sigma,M=M,steps=cfdm_steps,start_t=start_t,generator=generator)
+    x=sample(n,coarse_X,log_prior,w=w,sigma=sigma,M=M,steps=cfdm_steps,start_t=start_t,generator=generator,
+             return_weights=return_attribution)
+    attribution={"layout":None,"content":None}
+    if return_attribution:
+        x,attribution["layout"]=x
     x=x.reshape(n,C,*sizes[-1])
     levels=[x]
-    for size,bank in zip(reversed(sizes[:-1]),reversed(banks)):
-        x=sample_level(n,bank,(C,*size),p,x,steps,rho,eta,generator,max_elements)
+    for j,(size,bank) in enumerate(zip(reversed(sizes[:-1]),reversed(banks))):
+        finest=j==len(banks)-1
+        x=sample_level(n,bank,(C,*size),p,x,steps,rho,eta,generator,max_elements,return_attribution and finest,
+                       topk,n_sources)
+        if return_attribution and finest:
+            x,attribution["content"]=x
         levels.append(x)
-    if return_levels:
-        return x.flatten(1),levels
-    return x.flatten(1)
+    out=(x.flatten(1),)+((levels,) if return_levels else ())+((attribution,) if return_attribution else ())
+    return out if len(out)>1 else out[0]

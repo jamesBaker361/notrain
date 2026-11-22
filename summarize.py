@@ -18,19 +18,24 @@ parser.add_argument("--output_dir",type=str,default="outputs/summary")
 parser.add_argument("--label_width",type=int,default=150)
 
 # per-prompt metrics are averaged over prompts; fid_*/kid_* come from sample.py's --fid_samples pass ("__all__" rows)
-METRICS=["clip_score","prompt_accuracy","copy_rate","nn_dist","diversity","lpips_diversity","patches_kept","seconds_per_sample",
-         "fid_test","kid_test","precision_test","recall_test","fid_train","kid_train","precision_train","recall_train",
-         "fid_real","kid_real","precision_real","recall_real",
-         "fid_copy_rate","fid_nn_dist","dino_nn_sim","dino_copy_rate","fid_prompt_accuracy","fid_lpips_diversity","fid_seconds_per_sample"]
+METRICS=["clip_score","prompt_accuracy","itm_score","copy_rate","nn_dist","diversity","lpips_diversity","patches_kept","seconds_per_sample",
+         "fid_test","fid_std_test","kid_test","precision_test","recall_test","fid_train","kid_train","precision_train","recall_train",
+         "fid_real","fid_std_real","kid_real","precision_real","recall_real",
+         "fid_copy_rate","fid_nn_dist","dino_nn_sim","dino_copy_rate","fid_prompt_accuracy","fid_itm_score","fid_lpips_diversity","fid_seconds_per_sample"]
 
 
 def run_label(args:dict)->str:
     if args.get("method")=="net":
         model=args.get("model","")
+        # † public checkpoints (and fine-tunes of them) were trained on all of their dataset, possibly including
+        # our held-out split, so their fid_test/fid_real may be optimistic
         if model.startswith("pretrained:"):
-            return f"net {model.split(':',1)[1].split('/')[-1]} (as-is)"
+            return f"net {model.split(':',1)[1].split('/')[-1]} (as-is) †"
         # finetune.py runs live in weights/<name>/ema
-        return f"net {os.path.basename(os.path.dirname(model)) or model}"
+        name=os.path.basename(os.path.dirname(model)) or model
+        return f"net {name}"+(" †" if name.endswith("_ft") else "")
+    if args.get("method")=="pyramid" and args.get("pyramid_upsample"):
+        return f"cfdm c{args['coarse_size']} upsampled (no patch levels)"
     if args.get("method")=="pyramid":
         label=f"pyramid c{args['coarse_size']} p{args['patch_size']}"
         if args.get("heatmap_keep",1.0)<1:
@@ -44,6 +49,8 @@ def run_label(args:dict)->str:
         return f"cfdm K{args['top_k']}"
     if args.get("method")=="retrieval":
         return f"retrieval K{args['top_k']}"
+    if args.get("method")=="ls":
+        return f"ls machine K{args['top_k']}"
     # runs from removed samplers (CLIP tree, top-K node samplers) are still listed, by method and run dir
     return f"{args['method']} [{os.path.basename(os.path.normpath(args.get('output_dir','')))}]"
 
@@ -93,6 +100,8 @@ def main(args):
     lines=[header,"|"+"---|"*(len(columns)+2)]
     for e in table:
         lines.append(f"| {e['run']} | {e['w']} | "+" | ".join("-" if e[k] is None else f"{e[k]:.3f}" for k in columns)+" |")
+    if any("†" in e["run"] for e in table):
+        lines+=["","† public checkpoint (or a fine-tune of one) trained on all of its dataset, possibly including the held-out split: its held-out scores may be optimistic"]
     with open(os.path.join(args.output_dir,"summary.md"),"w") as f:
         f.write("\n".join(lines)+"\n")
     print("\n".join(lines))

@@ -57,18 +57,27 @@ def k_t(z:torch.Tensor,X:torch.Tensor,t:float,log_prior:torch.Tensor=None,w:floa
     return t*weights@X
 
 
+def smoothed_weights(z:torch.Tensor,X:torch.Tensor,t:float,log_prior:torch.Tensor=None,w:float=1.0,
+                     sigma:float=0.0,M:int=1,x_sq:torch.Tensor=None,generator:torch.Generator=None)->torch.Tensor:
+    '''
+    (B,N): the softmax weights over training points, averaged over the M smoothing perturbations z + sigma eps_m;
+    a convex combination per row, with smoothed_k_t = t * smoothed_weights @ X
+    '''
+    if sigma==0 or M<1:
+        return torch.softmax(weight_logits(z,X,t,log_prior,w,x_sq),dim=-1)
+    total=0
+    for _ in range(M):
+        eps=torch.randn(z.shape,generator=generator,device=z.device,dtype=z.dtype)
+        total=total+torch.softmax(weight_logits(z+sigma*eps,X,t,log_prior,w,x_sq),dim=-1)
+    return total/M
+
+
 def smoothed_k_t(z:torch.Tensor,X:torch.Tensor,t:float,log_prior:torch.Tensor=None,w:float=1.0,
                  sigma:float=0.0,M:int=1,x_sq:torch.Tensor=None,generator:torch.Generator=None)->torch.Tensor:
     '''
     1/M sum_m k_t(z + sigma eps_m) (Eq. 3); the text prior is not perturbed
     '''
-    if sigma==0 or M<1:
-        return k_t(z,X,t,log_prior,w,x_sq)
-    total=torch.zeros_like(z)
-    for _ in range(M):
-        eps=torch.randn(z.shape,generator=generator,device=z.device,dtype=z.dtype)
-        total+=k_t(z+sigma*eps,X,t,log_prior,w,x_sq)
-    return total/M
+    return t*smoothed_weights(z,X,t,log_prior,w,sigma,M,x_sq,generator)@X
 
 
 def score(z:torch.Tensor,X:torch.Tensor,t:float,log_prior:torch.Tensor=None,w:float=1.0,
@@ -104,10 +113,12 @@ def initial_sample(n:int,X:torch.Tensor,start_t:float,log_prior:torch.Tensor=Non
 
 @torch.no_grad()
 def sample(n:int,X:torch.Tensor,log_prior:torch.Tensor=None,w:float=1.0,sigma:float=0.0,M:int=1,
-           steps:int=50,start_t:float=0.0,generator:torch.Generator=None,return_trajectory:bool=False,z0:torch.Tensor=None):
+           steps:int=50,start_t:float=0.0,generator:torch.Generator=None,return_trajectory:bool=False,z0:torch.Tensor=None,
+           return_weights:bool=False):
     '''
     forward Euler from start_t to t=1 (Algorithm 1). The last step from t to 1 lands exactly
-    on smoothed_k_t(z)/t, so nothing blows up at t=1.
+    on smoothed_k_t(z)/t = smoothed_weights(z) @ X, so nothing blows up at t=1, and every sample is an exact
+    convex combination of training points: return_weights also returns those (n,N) weights (the attribution)
     X: (N,D) training points (flattened pixels or latents), log_prior: (N,) from text_log_prior
     z0: optional (n,D) starting point at start_t instead of initial_sample (e.g. shared noise with start_t ~ 0)
     '''
@@ -119,16 +130,17 @@ def sample(n:int,X:torch.Tensor,log_prior:torch.Tensor=None,w:float=1.0,sigma:fl
         # v_0 is undefined (1/t); k_0 = 0 so the first Euler step only rescales noise
         ts[0]=1e-4
     trajectory=[z]
+    weights=None
     for t,t_next in zip(ts[:-1],ts[1:]):
         if t_next>=1.0:
-            z=smoothed_k_t(z,X,t,log_prior,w,sigma,M,x_sq,generator)/t
+            weights=smoothed_weights(z,X,t,log_prior,w,sigma,M,x_sq,generator)
+            z=weights@X
         else:
             z=z+(t_next-t)*velocity(z,X,t,log_prior,w,sigma,M,x_sq,generator)
         if return_trajectory:
             trajectory.append(z)
-    if return_trajectory:
-        return z,trajectory
-    return z
+    out=(z,)+((trajectory,) if return_trajectory else ())+((weights,) if return_weights else ())
+    return out if len(out)>1 else z
 
 
 def median_distance(X:torch.Tensor,n_probe:int=512,generator:torch.Generator=None)->float:

@@ -102,3 +102,13 @@ def test_smoothing_leaves_training_set(setup):
     out=sample(16,X,None,sigma=1.0,M=4,steps=100,start_t=0.2,generator=g)
     assert torch.isfinite(out).all()
     assert (torch.cdist(out,X).min(-1).values>1e-3).any()
+
+
+def test_sample_weights_are_exact(setup):
+    X=setup[0] if isinstance(setup,tuple) else setup["X"]
+    g=torch.Generator().manual_seed(0)
+    out,weights=sample(5,X,None,w=0,sigma=0.1,M=3,steps=10,generator=g,return_weights=True)
+    assert weights.shape==(5,X.shape[0]) and torch.allclose(weights.sum(-1),torch.ones(5,dtype=weights.dtype),atol=1e-5)
+    assert torch.allclose(out,weights@X,atol=1e-5)
+    plain=sample(5,X,None,w=0,sigma=0.1,M=3,steps=10,generator=torch.Generator().manual_seed(0))
+    assert torch.allclose(out,plain,atol=1e-6)

@@ -4,6 +4,8 @@
 
 We generate text-conditioned images without training any network. Every sample is assembled from a fixed bank of training images by closed-form denoisers. A smoothed closed-form diffusion model sets the global layout at low resolution. At each finer scale, a closed-form patch denoiser adds real detail. Text guides both stages through CLIP~\cite{radford2021clip}: a prior over training images steers the layout, and a per-token decomposition of CLIP's image embedding steers patch selection~\cite{gandelsman2024interpreting}.
 
+Because both stages are closed-form, every sample is an exact convex combination of training data. Its attribution is therefore read off rather than estimated: down to which training pixels, from which images, make up each output pixel (Sec.~\ref{sec:attribution}). Removing images from the bank is the same as retraining without them, so attributions can be checked against exact counterfactuals.
+
 Throughout, we use the interpolation $z_t = t\,x + (1-t)\,\varepsilon$ with $\varepsilon\sim\mathcal N(0,I)$ and $t\in[0,1]$, so $t=0$ is pure noise and $t=1$ is clean data.
 
 \subsection{Image bank}
@@ -108,6 +110,23 @@ Optionally, we keep only the fraction $\kappa$ of tokens with the highest heat a
 
 At $w=0$, we use $K_p$ uniformly random images with no bias and no filtering.
 
+\subsection{Exact attribution}
+\label{sec:attribution}
+
+\paragraph{Layout.}
+The last CFDM step lands on $x^{(J)}=\bar k_{t}(z)/t=\sum_i a_i\,x_i^{(J)}$, where $a_i$ are the softmax weights of Eq.~\eqref{eq:kt} averaged over the $M$ smoothing perturbations. The weights $a\in\Delta^{K_c}$ are the exact layout attribution: the coarse sample \emph{is} this mixture of training images.
+
+\paragraph{Content.}
+The last step of the finest level is not blended, so the output is exactly the folded patch estimate. Let $\alpha_{l j}$ be the softmax weight of Eq.~\eqref{eq:patch} that query patch $l$, at top-left corner $(y_l,x_l)$, puts on bank patch $j$, at corner $(y_j,x_j)$ in parent image $\pi(j)$. Output pixel $(y,x)$ is offset $(d_y,d_x)=(y-y_l,x-x_l)$ in every query patch $l$ covering it, so
+\begin{equation}
+  x^{(0)}(y,x) = \sum_{l \ni (y,x)} \sum_j \frac{\omega(d_y,d_x)\,\alpha_{lj}}{\sum_{l'\ni(y,x)}\omega(d'_y,d'_x)}\; x_{\pi(j)}\big(y_j+d_y,\,x_j+d_x\big).
+  \label{eq:sources}
+\end{equation}
+Each output pixel is thus a convex combination of training pixels, with weights that sum to one. Summing the weights by parent image gives a per-pixel map of each image's share, and averaging the map over pixels gives the per-sample content attribution $c\in\Delta^{K_p}$. Keeping the source pixels themselves gives patch-level provenance: for each output pixel, the training image and the location it came from. A copied region shows up as one source pixel reached through all $p^2$ covering patches. To keep memory bounded, each query patch keeps its top $r=8$ bank patches, and each pixel keeps its top $4$ source pixels after merging duplicates; the per-image maps are exact.
+
+\paragraph{Counterfactual evaluation.}
+Deleting a set $S$ of images from the bank changes the retrieval, the CFDM mixture and the patch banks exactly as retraining without $S$ would. For each sample we delete the top-$k$ images under an attribution ranking and regenerate from the same noise. We then measure how far the sample moves (LPIPS, distance in bank space relative to $\bar d$, and DINOv2 similarity); a ranking that finds the images the sample depends on moves it more. We compare our rankings (content, layout, and their average) with post-hoc rankings by similarity to the sample (DINOv2, CLIP, and distance in bank space) and with $k$ random images among the prompt's top $K_c$ matches, for $k\in\{1,5,20\}$, $w=1$ and $8$ samples per prompt. A deletion of the empty set must leave the sample unchanged, which checks that the counterfactual shares the original's noise. We also report how often our ranking moves the sample more than each baseline on the same sample.
+
 \subsection{Implementation details}
 \label{sec:impl}
 
@@ -117,25 +136,33 @@ Unless stated otherwise: $K_c=1000$, $\sigma=0.25\,\bar d$, $M=4$, $t_0=0.2$, an
   \item $256\times256$ pixels: $S_J=16$, $p=7$, and $K_p=10$;
   \item $32\times32\times32$ FLUX.2 latents: $S_J=8$, $p=5$.
 \end{itemize}
-We compare five patch-selection variants:
+We compare six patch-selection variants:
 \begin{itemize}
   \item no heatmap ($\lambda=0$, $\kappa=1$);
   \item weighting only ($\lambda=1$);
   \item strict filtering ($\kappa=0.25$, $r=0$);
   \item filtering with random patches ($\kappa=0.25$, $r=0.25$);
+  \item the same, keeping only patches with at least half their pixels in kept tokens;
   \item filtering with random patches plus weighting ($\kappa=0.25$, $r=0.25$, $\lambda=1$).
 \end{itemize}
-We also run the whole-image CFDM at full resolution as a baseline. Equations~\eqref{eq:kt} and~\eqref{eq:patch} drop $\lVert z\rVert^2$, which is constant over components, and are evaluated in chunks of queries in single precision. For $256$px pixel banks, the bank stays in CPU memory and only the retrieved images are moved to the GPU.
+Closed-form baselines and ablations:
+\begin{itemize}
+  \item retrieval: training images drawn from $\operatorname{softmax}(w\log p(x_i\mid c))$ over the top $K_c$ matches, the $\sigma\to0$ limit of the CFDM;
+  \item the whole-image CFDM at full resolution (not at $256$px pixels, where it would need the bank on the GPU);
+  \item the CFDM layout alone, bicubic-upsampled to full resolution, to isolate what the patch levels add;
+  \item the local score machine of~\cite{kamb2024analytic} over the top $K_c$ matches, with the CelebA-64 patch schedule of~\cite{lukoianov2025locality} (not at $256$px pixels, for cost).
+\end{itemize} Equations~\eqref{eq:kt} and~\eqref{eq:patch} drop $\lVert z\rVert^2$, which is constant over components, and are evaluated in chunks of queries in single precision. For $256$px pixel banks, the bank stays in CPU memory and only the retrieved images are moved to the GPU.
 
 \subsection{Evaluation}
 \label{sec:eval}
 
-We sweep $w\in\{0,1,4\}$. For each $w$ we generate $500$ samples split evenly across prompts, and report:
+We sweep $w\in\{0,1,4\}$. For each $w$ we generate $2000$ samples split evenly across prompts, and report:
 \begin{itemize}
-  \item FID and KID (subset size $100$) against $2000$ held-out images (FID is biased at this sample size, so we compare it only between runs with the same $N$), and against $2000$ training images; a much better score against training images than against held-out images indicates memorization;
+  \item FID and KID (subset size $100$) against $2000$ held-out images, and against $2000$ training images; a much better score against training images than against held-out images indicates memorization. We report the bootstrap standard deviation of FID over resamplings of the samples. In latent spaces, the decoded held-out latents are the autoencoder's reconstructions, so we also score against the real held-out images, the only references comparable across spaces;
+  \item a ceiling: $2000$ decoded training images, disjoint from the training references, scored like samples. In a latent space this is the autoencoder's reconstruction limit; in pixel space, the finite-sample floor;
   \item $k$-NN precision and recall ($k=3$) in the same Inception feature space;
   \item copy rates: the distance to the nearest training image, relative to $\bar d$, and the nearest-neighbour cosine similarity in DINOv2 feature space~\cite{oquab2023dinov2};
-  \item text alignment, measured with an independent CLIP ViT-B/16 so the conditioning model does not grade itself: CLIP score, and prompt accuracy, the fraction of samples whose best-matching prompt is their own;
+  \item text alignment, measured with an independent CLIP ViT-B/16 so the conditioning model does not grade itself: CLIP score, and prompt accuracy, the fraction of samples whose best-matching prompt is their own. Since our samplers retrieve by CLIP, we also report a score from outside the CLIP family: the match probability of BLIP's image-text matching head~\cite{li2022blip};
   \item diversity: mean pairwise LPIPS~\cite{zhang2018lpips} among samples of the same prompt.
 \end{itemize}
-Baselines are diffusion models trained on the same images: public checkpoints as-is, the same checkpoints fine-tuned with cross-attention to CLIP text tokens, and the same architectures trained from scratch on the bank. Following~\cite{lukoianov2025locality}, we also measure how well closed-form denoisers (the ideal denoiser, the CFDM, and the local score machine of~\cite{kamb2024analytic}) predict a trained network's samples from shared initial noise.
+Baselines are diffusion models trained on the same images: public checkpoints as-is, the same checkpoints fine-tuned with cross-attention to CLIP text tokens, and the same architectures trained from scratch on the bank. The public CelebA-HQ checkpoints were trained on the full dataset, which may include our held-out split, so their held-out scores (and those of their fine-tunes) may be optimistic; the scratch networks, trained only on the bank, are the clean comparison. Following~\cite{lukoianov2025locality}, we also measure how well closed-form denoisers (the ideal denoiser, the CFDM, and the local score machine of~\cite{kamb2024analytic}) predict a trained network's samples from shared initial noise.

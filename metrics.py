@@ -12,7 +12,10 @@ ReferenceMetrics, against a fixed reference set (needs torch-fidelity):
     perfect, so "vs train" is only useful next to "vs test" (a much better train score means copying)
 DinoCopy: nearest-training-image cosine similarity in DINOv2 feature space, which catches near-copies
     (shifted, recolored, blended) that a pixel distance misses
+    fid_std: the bootstrap std of FID over resamplings of the samples (the reference statistics fixed)
 LpipsDiversity: mean pairwise LPIPS between samples of the same prompt (perceptual diversity)
+ItmScore: BLIP's image-text matching probability, a text-alignment score from outside the CLIP family (CLIP score
+    is partly circular for samplers that retrieve by CLIP)
 prompt_accuracy: fraction of samples whose best-matching prompt (by an independent CLIP) is their own
 '''
 import os
@@ -85,11 +88,54 @@ class ReferenceMetrics:
             self.kid.update(batch,real=False)
             self.fake_feats.append(self.features(batch))
 
-    def compute(self)->dict:
+    def compute(self,n_boot:int=50,seed:int=0)->dict:
         kid_mean,kid_std=self.kid.compute()
-        precision,recall=precision_recall(self.real_feats,torch.cat(self.fake_feats),self.pr_k)
-        return {"fid":float(self.fid.compute()),"kid":float(kid_mean),"kid_std":float(kid_std),
-                "precision":precision,"recall":recall}
+        fake=torch.cat(self.fake_feats)
+        precision,recall=precision_recall(self.real_feats,fake,self.pr_k)
+        out={"fid":float(self.fid.compute()),"kid":float(kid_mean),"kid_std":float(kid_std),
+             "precision":precision,"recall":recall}
+        if n_boot>0:
+            out["fid_std"]=bootstrap_fid_std(self.real_feats,fake,n_boot,seed)
+        return out
+
+
+def _gaussian(feats:torch.Tensor):
+    feats=feats.double()
+    mu=feats.mean(0)
+    centered=feats-mu
+    return mu,centered.T@centered/(feats.shape[0]-1)
+
+
+def frechet_distance(mu1,cov1_sqrt,cov1,feats2:torch.Tensor)->float:
+    '''
+    ||mu1-mu2||^2 + tr(cov1 + cov2 - 2 (cov1 cov2)^(1/2)) against the Gaussian fit of feats2 (n,d): tr (cov1 cov2)^(1/2)
+    is the sum of the square roots of the eigenvalues of B^T B/(n-1), B = (feats2 - mu2) cov1^(1/2), which are
+    those of the smaller B B^T/(n-1) (symmetric PSD, so eigvalsh)
+    '''
+    feats2=feats2.double()
+    mu2=feats2.mean(0)
+    A=feats2-mu2
+    B=A@cov1_sqrt
+    n=feats2.shape[0]
+    gram=B@B.T if n<B.shape[1] else B.T@B
+    eig=torch.linalg.eigvalsh(gram/(n-1)).clamp_min(0)
+    return float((mu1-mu2).pow(2).sum()+torch.trace(cov1)+A.pow(2).sum()/(n-1)-2*eig.sqrt().sum())
+
+
+def bootstrap_fid_std(real:torch.Tensor,fake:torch.Tensor,n_boot:int=50,seed:int=0)->float:
+    '''
+    std of FID over n_boot resamplings (with replacement) of the fake features, the reference statistics fixed:
+    the sampling noise of one run's FID
+    '''
+    mu1,cov1=_gaussian(real)
+    vals,vecs=torch.linalg.eigh(cov1)
+    cov1_sqrt=vecs@torch.diag(vals.clamp_min(0).sqrt())@vecs.T
+    g=torch.Generator().manual_seed(seed)
+    fids=[]
+    for _ in range(n_boot):
+        idx=torch.randint(fake.shape[0],(fake.shape[0],),generator=g).to(fake.device)
+        fids.append(frechet_distance(mu1,cov1_sqrt,cov1,fake[idx]))
+    return float(torch.tensor(fids).std())
 
 
 class DinoCopy:
@@ -156,6 +202,28 @@ class LpipsDiversity:
         a=pixels[[i for i,_ in pairs]].to(self.device).float()
         b=pixels[[j for _,j in pairs]].to(self.device).float()
         return float(self.model(a,b).mean())
+
+
+class ItmScore:
+    def __init__(self,model_name:str,device,batch_size:int=32):
+        from transformers import BlipForImageTextRetrieval,BlipProcessor
+        self.device=device
+        self.batch_size=batch_size
+        self.processor=BlipProcessor.from_pretrained(model_name)
+        self.model=BlipForImageTextRetrieval.from_pretrained(model_name).to(device).eval()
+
+    @torch.no_grad()
+    def score(self,images:list,texts:list)->torch.Tensor:
+        '''
+        images: PIL images, texts: one per image -> (B,) probability that each image matches its text
+        '''
+        out=[]
+        for i in range(0,len(images),self.batch_size):
+            inputs=self.processor(images=images[i:i+self.batch_size],text=texts[i:i+self.batch_size],
+                                  return_tensors="pt",padding=True).to(self.device)
+            logits=self.model(**inputs,use_itm_head=True).itm_score
+            out.append(torch.softmax(logits.float(),dim=-1)[:,1].cpu())
+        return torch.cat(out)
 
 
 def prompt_accuracy(image_embeds:torch.Tensor,text_embeds:torch.Tensor,prompt_ids:torch.Tensor)->float:

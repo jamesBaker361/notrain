@@ -63,7 +63,9 @@ sbatch runpygpu_chip.sh sample.py --bank banks/celebahq_pix64.pt --method pyrami
 
 `sample.py --fid_samples N` generates N extra samples per w, spread across the prompts, and reports:
 
-- `fid_test` / `kid_test`: FID and KID against held-out images (`embed.py --holdout K`), which the samplers never see. KID is unbiased at a few hundred samples; FID is biased upward at small N, so only compare runs with the same N.
+- `fid_test` / `kid_test`: FID and KID against held-out images (`embed.py --holdout K`), which the samplers never see. KID is unbiased at a few hundred samples; FID is biased upward at small N, so only compare runs with the same N. `fid_std_*` is FID's bootstrap std over resamplings of the samples.
+- `itm_score` / `fid_itm_score` (`--itm_model`, e.g. `Salesforce/blip-itm-base-coco`): BLIP's image-text match probability, a text-alignment score from outside the CLIP family. CLIP score is partly circular for samplers that retrieve by CLIP.
+- Nets marked † in `summary.md` are public checkpoints, or fine-tunes of them, that were trained on the full dataset, possibly including the held-out split. The scratch nets are the clean comparison.
 - `fid_real` / `kid_real` (latent banks): the same against the real held-out images, reloaded from the dataset. `fid_test` compares to the autoencoder's reconstructions, so only `fid_real` is comparable across spaces.
 - `ceiling` (top level of `metrics.json`, its own row in `summarize.py`): `--fid_samples` decoded training images scored like samples. In a latent space this is the autoencoder's reconstruction limit. In pixel space it is the finite-sample floor at this N.
 - `--method retrieval`: the baseline, which draws training images from the w-sharpened prior over the top-k CLIP matches (uniform at w=0). It is the CFDM's σ → 0 limit, so its `copy_rate` is 1. A closed-form sampler has to beat it on something other than copying.
@@ -100,14 +102,37 @@ The experiments use `korexyz/celeba-hq-256x256` (28k train / 2k validation) with
 
 `sample.py --method net --model ...` takes `pretrained:<repo>` (the checkpoint as-is, unconditional) or a `finetune.py` checkpoint, where w is the CFG scale. `agreement.py` compares every method against a target network from the same noise.
 
-`scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement [setting]` prints the cluster jobs for the four CelebA-HQ settings:
+Each stage has a numbered script in `scripts/` that prints its cluster jobs (`python scripts/gen_<N>_<stage>.py [setting ...] | bash`). Run them in order, each after the previous stage's jobs have finished. Stage 3 only needs stage 1, so it can run alongside stage 2:
+
+1. `gen_1_build.py`: embed, caption and compute the CLIP tokens, one step per setting per run. Re-run it until every setting reports "already built".
+2. `gen_2_train.py`: the text-conditional nets.
+3. `gen_3_sample_closed.py`: retrieval, `cfdm` and the pyramid variants.
+4. `gen_4_sample_nets.py`: the trained nets.
+5. `gen_5_agreement.py`: the agreement with the scratch net.
+6. `gen_6_attribution.py`: exact attribution and leave-k-out counterfactuals (`attribution.py`). It only needs stage 1.
+7. `gen_7_summarize.py`: `summarize.py` over each setting's finished runs. This one runs locally, not through sbatch.
+
+The settings live in `scripts/experiment_config.py`. There are four CelebA-HQ settings:
 
 - `celebahq_pix64`: 64×64 pixels, the setting of Lukoianov et al. No 64px checkpoint exists, so its text-conditional nets use the `google/ddpm-celebahq-256` architecture run at 64×64 (`finetune.py --sample_size 64`; the UNet is fully convolutional). One is trained from scratch (the agreement target) and one is fine-tuned from the 256px weights.
 - `celebahq_pix256`: 256×256 pixels, with `google/ddpm-celebahq-256` as-is, fine-tuned and from scratch. The 11GB float16 bank stays in CPU memory.
 - `celebahq_ldm`: the 3×64×64 VQ latents, with `CompVis/ldm-celebahq-256` as-is, fine-tuned and from scratch.
 - `celebahq_flux2`: the 32×32×32 FLUX.2 latents, with one scratch net.
 
-`build` embeds, captions and computes the CLIP tokens, one step per setting at a time: re-run it once the submitted jobs finish to queue the next step. All four banks share one token file, `banks/celebahq_tokens.pt`, since CLIP sees the original images in every space. `sample_closed` runs the whole-image `cfdm` over the top-1000 matches (except at 256px, where it would need the bank on the GPU), plus five pyramid variants (`pyramid_variants`): no heatmap, heatmap bonus only, hard filter to the top quarter of tokens, that plus a random quarter of the other patches, and that filter plus the bonus. The pyramid geometry is per setting: 16 → 64 with 7×7 patches for 64px pixels and the VQ latents, 16 → 256 with 7×7 patches from 10 images at 256px, and 8 → 32 with 5×5 for the FLUX.2 latents. `sample_nets` runs the trained nets. Runs with a `metrics.json` already on disk are skipped. `scripts/gen_summarize.py [setting]` prints a `summarize.py` command for each setting with finished runs, which collects them into `summary.md`/`summary.csv` and side-by-side images.
+All four banks share one token file, `banks/celebahq_tokens.pt`, since CLIP sees the original images in every space. Stage 3 runs the retrieval baseline, the `ls` machine (not at 256px, for cost), the whole-image `cfdm` over the top-1000 matches (except at 256px, where it would need the bank on the GPU), the CFDM layout alone upsampled (`cfdm_upsample`, what the patch levels add), plus six pyramid variants (`pyramid_variants`): no heatmap, heatmap bonus only, hard filter to the top quarter of tokens, that plus a random quarter of the other patches, the same with `--heatmap_overlap 0.5`, and the filter plus the bonus. The pyramid geometry is per setting: 16 → 64 with 7×7 patches for 64px pixels and the VQ latents, 16 → 256 with 7×7 patches from 10 images at 256px, and 8 → 32 with 5×5 for the FLUX.2 latents. Runs with a `metrics.json` already on disk are skipped. `summarize.py` collects each setting's runs into `summary.md`/`summary.csv` and side-by-side images.
+
+## Attribution
+
+Every retrieval, `cfdm` or `pyramid` sample is an exact convex combination of training data (`samplers.py`):
+
+- **Layout:** the CFDM's last step lands on Σᵢ aᵢ xᵢ, so `cfdm.sample(..., return_weights=True)` gives the weights.
+- **Content:** the pyramid's finest level ends on an unblended patch fold, so every output pixel is a weighted sum of training pixels: the pixel at the same offset inside each source patch of each query patch covering it. `sample_pyramid(..., return_attribution=True)` returns per-pixel shares of each patch image (exact) and each pixel's top source pixels as image, y, x and weight (`pixel_sources`). Each query patch keeps its top `--attr_topk` bank patches; each pixel keeps `--attr_sources` sources after merging duplicates.
+
+`ClosedForm.generate(..., exclude=rows)` runs on the bank without those images. That is exact retraining without them, so `attribution.py` scores attribution against ground truth. For each sample it deletes the top-k images under a ranking, regenerates with the same noise, and measures how far the sample moves (LPIPS, bank-space distance, DINO similarity). Rankings: ours (content, layout, both), post-hoc DINO / CLIP / pixel similarity, and random among the prompt's matches. The `none` row (delete nothing) must be 0. `summary.md` also gives how often ours moves the sample more than each baseline. `attribution.png` shows, per sample: the sample, the top-source mosaic, provenance coloured by the top-5 source images, those images, and the sample without them and without the top-5 DINO matches.
+
+```bash
+sbatch runpygpu_chip.sh attribution.py --bank banks/celebahq_pix64.pt --method pyramid --tokens banks/celebahq_tokens.pt --prompt_file prompts/celeb.txt --output_dir outputs/attribution_celebahq_pix64_pyramid
+```
 
 ## Mechanistic pilot: do closed-form machines predict a trained network?
 
