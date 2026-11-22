@@ -11,7 +11,8 @@
 # all four share one file of CLIP token embeddings (clip_tokens.py): CLIP sees the original images whatever the space
 # trained nets per setting: the checkpoint as-is (unconditional), the checkpoint + cross-attention fine-tuned on
 # captions ("ft"), and the same architecture + cross-attention trained from scratch on our bank ("scratch")
-# usage: python scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement|summarize [setting ...]
+# usage: python scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement [setting ...]
+# (summaries of the finished runs: scripts/gen_summarize.py)
 # (sample = sample_closed + sample_nets); sample_closed only needs build, sample_nets and agreement need train
 # sample_closed: the retrieval baseline, the whole-image CFDM on the prompt's top-K CLIP matches, and each pyramid
 # variant (pyramid_variants)
@@ -71,7 +72,7 @@ SETTINGS={
 for cfg in SETTINGS.values():
     cfg.update({"blip":True,"prompts":"prompts/celeb.txt","tokens":TOKENS})
 settings=sys.argv[2:] or list(SETTINGS)
-STAGES=["build","train","sample","sample_closed","sample_nets","agreement","summarize","all"]
+STAGES=["build","train","sample","sample_closed","sample_nets","agreement","all"]
 if stage not in STAGES or any(s not in SETTINGS for s in settings):
     sys.exit(f"usage: python scripts/gen_experiments.py <stage> [setting ...]\n  stages: {' '.join(STAGES)}\n  settings: {' '.join(SETTINGS)}\n  got stage={stage!r} settings={settings}")
 
@@ -115,9 +116,8 @@ def has_captions(bank:str):
         return None
 
 
-def sbatch(job:str,log:str,cmd:str,dependency:str="",script:str="runpygpu_chip.sh")->str:
-    dep=f"--dependency=afterok:{dependency} " if dependency else ""
-    return f"sbatch --parsable {dep}-J {job} --err=slurm_chip/{log}.err --out=slurm_chip/{log}.out {script} {cmd}"
+def sbatch(job:str,log:str,cmd:str,script:str="runpygpu_chip.sh")->str:
+    return f"sbatch -J {job} --err=slurm_chip/{log}.err --out=slurm_chip/{log}.out {script} {cmd}"
 
 
 # shared token files already submitted by an earlier setting in this run
@@ -135,34 +135,24 @@ for name in settings:
     if cfg.get("channels"):
         size+=f" --channels {cfg['channels']}"
     if stage in ["build","all"]:
-        # embed -> (BLIP captions) -> CLIP token embeddings (clip_tokens.py, for the pyramid's heatmaps), each waiting
-        # for the one before; steps whose output is already on disk are skipped (an existing bank isn't re-embedded,
-        # a captioned one isn't re-captioned, existing tokens aren't recomputed), so re-running build only submits
-        # what's missing
+        # embed -> (BLIP captions) -> CLIP token embeddings (clip_tokens.py, for the pyramid's heatmaps): only the
+        # next missing step is submitted (caption.py rewrites the bank, so nothing else may read it meanwhile);
+        # re-run build once those jobs are done to submit the step after
         # (jobs still queued or running aren't detected: don't re-run build until they're done)
-        need_embed=not os.path.exists(bank)
-        captioned=False if need_embed else has_captions(bank)
-        jobs=[]
-        if captioned is None:
+        captioned=False if not os.path.exists(bank) else has_captions(bank)
+        if not os.path.exists(bank):
+            print(sbatch("embed_"+name,"embed/"+name,f"embed.py {cfg['embed']} --save_path {bank}"))
+        elif captioned is None:
             print(f"# {name}: {bank} can't be read (still being written?), skipping its build",file=sys.stderr)
-        elif need_embed:
-            jobs.append(("embed_"+name,"embed/"+name,f"embed.py {cfg['embed']} --save_path {bank}"))
-        if cfg["blip"] and captioned is False:
-            jobs.append(("caption_"+name,"caption/"+name,f"caption.py --bank {bank} {cfg.get('caption','')}"))
-        # one shared token file per image set, from whichever of its banks comes first
-        if captioned is not None and not os.path.exists(cfg["tokens"]) and cfg["tokens"] not in tokens_queued:
+        elif cfg["blip"] and not captioned:
+            print(sbatch("caption_"+name,"caption/"+name,f"caption.py --bank {bank} {cfg.get('caption','')}"))
+        elif not os.path.exists(cfg["tokens"]) and cfg["tokens"] not in tokens_queued:
+            # one shared token file per image set, from whichever of its banks is ready first
             tokens_queued.add(cfg["tokens"])
             log=os.path.basename(cfg["tokens"])[:-3]
-            jobs.append(("tokens_"+name,"tokens/"+log,f"clip_tokens.py --bank {bank} --save_path {cfg['tokens']}"))
-        if captioned is not None and not jobs:
+            print(sbatch("tokens_"+name,"tokens/"+log,f"clip_tokens.py --bank {bank} --save_path {cfg['tokens']}"))
+        elif os.path.exists(cfg["tokens"]):
             print(f"# {name}: bank, captions and CLIP tokens already built",file=sys.stderr)
-        parts=[]
-        dep=""
-        for job,log,cmd in jobs:
-            parts.append(f"jid=$({sbatch(job,log,cmd,dep)})")
-            dep="$jid"
-        if parts:
-            print(" && ".join(parts))
     if stage in ["train","all"]:
         for kind,flags in train_flags.items():
             if kind not in nets:
@@ -193,5 +183,3 @@ for name in settings:
         # target: the net trained from scratch on exactly our bank; the checkpoint and its fine-tune as "another DDPM"
         others=" ".join(v for k,v in nets.items() if k!="scratch")
         print(sbatch(f"agree_{name}",f"agreement/{name}",f"agreement.py --bank {bank} --model {nets['scratch']} --other_models {others} --methods ideal cfdm ls --n 64 --output_dir outputs/agreement_{name}"))
-    if stage in ["summarize","all"]:
-        print(f"python summarize.py --runs 'outputs/{name}_*' --output_dir outputs/summary_{name}")

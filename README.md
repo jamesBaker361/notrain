@@ -100,14 +100,14 @@ The experiments use `korexyz/celeba-hq-256x256` (28k train / 2k validation) with
 
 `sample.py --method net --model ...` takes `pretrained:<repo>` (the checkpoint as-is, unconditional) or a `finetune.py` checkpoint, where w is the CFG scale. `agreement.py` compares every method against a target network from the same noise.
 
-`scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement|summarize [setting]` prints the cluster jobs for the four CelebA-HQ settings:
+`scripts/gen_experiments.py build|train|sample_closed|sample_nets|agreement [setting]` prints the cluster jobs for the four CelebA-HQ settings:
 
 - `celebahq_pix64`: 64×64 pixels, the setting of Lukoianov et al. No 64px checkpoint exists, so its text-conditional nets use the `google/ddpm-celebahq-256` architecture run at 64×64 (`finetune.py --sample_size 64`; the UNet is fully convolutional). One is trained from scratch (the agreement target) and one is fine-tuned from the 256px weights.
 - `celebahq_pix256`: 256×256 pixels, with `google/ddpm-celebahq-256` as-is, fine-tuned and from scratch. The 11GB float16 bank stays in CPU memory.
 - `celebahq_ldm`: the 3×64×64 VQ latents, with `CompVis/ldm-celebahq-256` as-is, fine-tuned and from scratch.
 - `celebahq_flux2`: the 32×32×32 FLUX.2 latents, with one scratch net.
 
-`build` embeds, captions and computes the CLIP tokens. All four banks share one token file, `banks/celebahq_tokens.pt`, since CLIP sees the original images in every space. `sample_closed` runs the whole-image `cfdm` over the top-1000 matches (except at 256px, where it would need the bank on the GPU), plus five pyramid variants (`pyramid_variants`): no heatmap, heatmap bonus only, hard filter to the top quarter of tokens, that plus a random quarter of the other patches, and that filter plus the bonus. The pyramid geometry is per setting: 16 → 64 with 7×7 patches for 64px pixels and the VQ latents, 16 → 256 with 7×7 patches from 10 images at 256px, and 8 → 32 with 5×5 for the FLUX.2 latents. `sample_nets` runs the trained nets. Runs with a `metrics.json` already on disk are skipped. `summarize.py` collects the runs into `summary.md`/`summary.csv` and side-by-side images.
+`build` embeds, captions and computes the CLIP tokens, one step per setting at a time: re-run it once the submitted jobs finish to queue the next step. All four banks share one token file, `banks/celebahq_tokens.pt`, since CLIP sees the original images in every space. `sample_closed` runs the whole-image `cfdm` over the top-1000 matches (except at 256px, where it would need the bank on the GPU), plus five pyramid variants (`pyramid_variants`): no heatmap, heatmap bonus only, hard filter to the top quarter of tokens, that plus a random quarter of the other patches, and that filter plus the bonus. The pyramid geometry is per setting: 16 → 64 with 7×7 patches for 64px pixels and the VQ latents, 16 → 256 with 7×7 patches from 10 images at 256px, and 8 → 32 with 5×5 for the FLUX.2 latents. `sample_nets` runs the trained nets. Runs with a `metrics.json` already on disk are skipped. `scripts/gen_summarize.py [setting]` prints a `summarize.py` command for each setting with finished runs, which collects them into `summary.md`/`summary.csv` and side-by-side images.
 
 ## Mechanistic pilot: do closed-form machines predict a trained network?
 
