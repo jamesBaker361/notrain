@@ -144,6 +144,11 @@ def unsharp_mask(pixels:torch.Tensor,amount:float=1.0,radius:float=1.0,threshold
     return (x+amount*detail).clamp(-1,1)
 
 
+def row_chunk(X:torch.Tensor,max_bytes:float=2**29)->int:
+    # bank rows per chunk so a float32 copy of the chunk stays under max_bytes (4096 rows of 256px pixels are 3GB)
+    return max(1,int(max_bytes//(X[0].numel()*4)))
+
+
 def bank_to_pixels(bank:dict,flat:torch.Tensor,vae:AutoencoderKL=None,batch_size:int=8)->torch.Tensor:
     '''
     flat: (B,D) points in bank space -> (B,C,H,W) pixels in [-1,1]

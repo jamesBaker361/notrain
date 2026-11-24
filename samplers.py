@@ -40,7 +40,7 @@ def add_sampler_args(parser):
     parser.add_argument("--tokens",type=str,default="",help="pyramid heatmaps: the bank's CLIP token embeddings from clip_tokens.py; defaults to <bank>_tokens.pt")
     parser.add_argument("--heatmap_baseline",type=str,nargs="+",default=["a photo.","an image.","a picture."],help="pyramid: generic texts whose heatmaps, with the other prompts', are averaged and subtracted")
     parser.add_argument("--ls_patch_fracs",type=float,nargs="+",default=None,help="ls: patch sizes from noise to data as fractions of the side (default: Lukoianov et al.'s CelebA-64 fit)")
-    parser.add_argument("--ls_chunk",type=int,default=1024,help="ls: training images per chunk (memory)")
+    parser.add_argument("--ls_chunk",type=int,default=1024,help="ls: at most this many training images per chunk (fewer for big batches, for memory)")
     parser.add_argument("--attr_topk",type=int,default=8,help="pyramid attribution: bank patches kept per query patch for the per-pixel sources")
     parser.add_argument("--attr_sources",type=int,default=4,help="pyramid attribution: source pixels kept per output pixel")
     parser.add_argument("--bank_device",type=str,default="auto",choices=["auto","cpu","cuda"],help="where the bank lives; auto keeps banks over 4GB (e.g. 256px pixels) in CPU memory and moves only what's needed")
@@ -57,8 +57,12 @@ def load_bank_tokens(path:str,bank:dict,T:torch.Tensor,device):
     tokens=torch.load(path,weights_only=False,mmap=True)
     assert tokens["clip_model"]==bank["clip_model"] and tokens["tokens"].shape[0]==bank["X"].shape[0],\
         f"{path} doesn't match the bank ({tokens['clip_model']}, {tokens['tokens'].shape[0]} rows)"
-    same=(tokens["T"].float().to(device)*T).sum(-1).min().item()
-    assert same>0.98,f"{path} was built from different images than the bank (min CLIP cosine {same:.3f})"
+    # each probed row's best match among all of the token file's CLIP embeddings must be its own row: robust to
+    # the precision differences of banks embedded in fp16 or bf16, which a cosine threshold isn't
+    T_tokens=tokens["T"].float().to(device)
+    probe=torch.randperm(T.shape[0],generator=torch.Generator().manual_seed(0))[:1000].to(device)
+    same=((T[probe]@T_tokens.T).argmax(-1)==probe).float().mean().item()
+    assert same>0.99,f"{path} was built from different images than the bank (rows matching themselves: {same:.3f})"
     print(f"CLIP tokens {tuple(tokens['tokens'].shape)} from {path} (last {tokens['n_layers']} layers)")
     return tokens
 
@@ -72,7 +76,7 @@ class ClosedForm:
         assert args.method in METHODS,args.method
         self.args,self.bank,self.X,self.T,self.log_priors,self.device=args,bank,X,T,log_priors,device
         self.shape=bank["shape"]
-        if X.device!=torch.device(device) and args.method=="cfdm":
+        if X.device.type!=torch.device(device).type and args.method=="cfdm":
             raise ValueError("whole-bank cfdm needs the bank on the GPU; use --method pyramid or --bank_device cuda")
         # typical distance between bank points: sets the smoothing and normalizes the copy metric
         self.generator=torch.Generator(device=device).manual_seed(args.seed)
@@ -197,7 +201,9 @@ class ClosedForm:
         X_w=X if sub is None else X[sub.to(X.device)]
         if args.method=="ls":
             z0=torch.randn((n,*self.shape),generator=self.generator,device=self.device)
-            out=machine_sample("ls",z0,X_w.reshape(-1,*self.shape),self.ls_schedule,args.steps,log_prior,w,chunk=args.ls_chunk)
+            # the ls machine holds (n, chunk, H, W) logits: shrink the chunk for big batches
+            chunk=max(1,min(args.ls_chunk,2**26//(n*self.shape[1]*self.shape[2])))
+            out=machine_sample("ls",z0,X_w.reshape(-1,*self.shape),self.ls_schedule,args.steps,log_prior,w,chunk=chunk)
             return out.flatten(1),prior_mass,{},None
         if args.method=="cfdm":
             out=sample(n,X_w,log_prior,w=w,sigma=self.sigma,M=args.M,steps=args.steps,start_t=args.start_t,

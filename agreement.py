@@ -52,7 +52,7 @@ def main(args):
     if bank_device=="cuda":
         bank_device=device
     X=bank["X"].to(bank_device)
-    if X.device==torch.device(device):
+    if X.device.type==torch.device(device).type:
         X=X.float()
     Xr=X.reshape(-1,*shape)
     vae=load_bank_vae(bank,device)
@@ -70,7 +70,7 @@ def main(args):
 
     methods=[]
     for m in args.methods:
-        if m=="cfdm" and X.device!=torch.device(device):
+        if m=="cfdm" and X.device.type!=torch.device(device).type:
             print("skipping cfdm: it needs the bank on the GPU")
         else:
             methods.append(m)

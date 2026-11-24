@@ -29,7 +29,7 @@ from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from cfdm import text_log_prior,median_distance
 from samplers import METHODS,ClosedForm,add_sampler_args
-from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask,held_out_pixels
+from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,unsharp_mask,held_out_pixels,row_chunk
 from metrics import ReferenceMetrics,DinoCopy,LpipsDiversity,ItmScore,prompt_accuracy
 
 parser=argparse.ArgumentParser()
@@ -127,8 +127,9 @@ def main(args):
         # distance to the closest training point, relative to the typical pairwise distance; streams the bank
         # through the GPU in chunks so it also works when X lives on the CPU
         best=torch.full((out.shape[0],),float("inf"),device=out.device)
-        for j in range(0,X.shape[0],4096):
-            Xc=X[j:j+4096].to(out.device).float()
+        chunk=row_chunk(X)
+        for j in range(0,X.shape[0],chunk):
+            Xc=X[j:j+chunk].to(out.device).float()
             best=torch.minimum(best,torch.cdist(out.float(),Xc).min(-1).values)
         return best/scale
 

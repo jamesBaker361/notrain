@@ -88,14 +88,15 @@ class ReferenceMetrics:
             self.kid.update(batch,real=False)
             self.fake_feats.append(self.features(batch))
 
-    def compute(self,n_boot:int=50,seed:int=0)->dict:
+    def compute(self,n_boot:int=20,seed:int=0)->dict:
         kid_mean,kid_std=self.kid.compute()
         fake=torch.cat(self.fake_feats)
         precision,recall=precision_recall(self.real_feats,fake,self.pr_k)
         out={"fid":float(self.fid.compute()),"kid":float(kid_mean),"kid_std":float(kid_std),
              "precision":precision,"recall":recall}
         if n_boot>0:
-            out["fid_std"]=bootstrap_fid_std(self.real_feats,fake,n_boot,seed)
+            # on the CPU: cuSOLVER can fail to initialize on a GPU the sampler has filled
+            out["fid_std"]=bootstrap_fid_std(self.real_feats.cpu(),fake.cpu(),n_boot,seed)
         return out
 
 
@@ -122,7 +123,7 @@ def frechet_distance(mu1,cov1_sqrt,cov1,feats2:torch.Tensor)->float:
     return float((mu1-mu2).pow(2).sum()+torch.trace(cov1)+A.pow(2).sum()/(n-1)-2*eig.sqrt().sum())
 
 
-def bootstrap_fid_std(real:torch.Tensor,fake:torch.Tensor,n_boot:int=50,seed:int=0)->float:
+def bootstrap_fid_std(real:torch.Tensor,fake:torch.Tensor,n_boot:int=20,seed:int=0)->float:
     '''
     std of FID over n_boot resamplings (with replacement) of the fake features, the reference statistics fixed:
     the sampling noise of one run's FID

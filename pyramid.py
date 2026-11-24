@@ -46,11 +46,13 @@ def pyramid_sizes(H:int,W:int,coarse_size:int)->list:
     return sizes
 
 
-def downsample_flat(X:torch.Tensor,shape:tuple,size:tuple,device,chunk:int=4096)->torch.Tensor:
+def downsample_flat(X:torch.Tensor,shape:tuple,size:tuple,device,chunk:int=0)->torch.Tensor:
     '''
-    (N,C*H*W) bank points, possibly on the CPU in float16 -> (N,C*h*w) float32 on device
+    (N,C*H*W) bank points, possibly on the CPU in float16 -> (N,C*h*w) float32 on device; chunk: rows moved to the
+    device at a time (0: about 512MB of them)
     '''
     C,H,W=shape
+    chunk=chunk or max(1,2**27//(C*H*W))
     return torch.cat([resize(X[i:i+chunk].to(device).float().reshape(-1,C,H,W),size).flatten(1)
                       for i in range(0,X.shape[0],chunk)])
 

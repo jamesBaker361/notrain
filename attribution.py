@@ -27,7 +27,7 @@ from experiment_helpers.gpu_details import print_details
 from experiment_helpers.image_helpers import concat_images_horizontally,concat_images_vertically
 from cfdm import text_log_prior
 from samplers import ClosedForm,add_sampler_args
-from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil
+from bank import load_clip,encode_texts_clip,encode_images_clip,load_bank_vae,bank_to_pixels,to_pil,row_chunk
 from metrics import DinoCopy,LpipsDiversity
 
 parser=argparse.ArgumentParser()
@@ -86,7 +86,8 @@ def main(args):
         if dino is not None:
             scores["dino"]=(dino.embed(pixels)@dino.train_feats.T)[0].cpu()
         scores["clip"]=(encode_images_clip(clip_model,clip_processor,to_pil(pixels),device)@T.T)[0].cpu()
-        scores["pixel"]=-torch.cat([torch.cdist(out.float(),X[j:j+4096].to(device).float())[0].cpu() for j in range(0,X.shape[0],4096)])
+        chunk=row_chunk(X)
+        scores["pixel"]=-torch.cat([torch.cdist(out.float(),X[j:j+chunk].to(device).float())[0].cpu() for j in range(0,X.shape[0],chunk)])
         pool=torch.topk(log_priors[p],min(args.top_k if args.top_k>0 else X.shape[0],X.shape[0])).indices.cpu()
         scores["random"]=torch.full((X.shape[0],),-float("inf"))
         scores["random"][pool]=torch.rand(pool.numel(),generator=torch.Generator().manual_seed(seed))
@@ -106,9 +107,9 @@ def main(args):
         if "sources" in attr:
             s=attr["sources"]
             img,ys,xs=s["image"][0,:,:,0],s["y"][0,:,:,0],s["x"][0,:,:,0]
-            src=X[img.clamp_min(0).flatten().to(X.device)].to(device).float().reshape(-1,*shape)
-            mosaic=src[torch.arange(img.numel(),device=device),:,ys.flatten().to(device),xs.flatten().to(device)]
-            mosaic=mosaic.T.reshape(1,shape[0],*img.shape)
+            # each pixel's top source pixel, gathered straight from the bank (not a whole image per pixel)
+            src=X.view(-1,*shape)[img.clamp_min(0).flatten().to(X.device),:,ys.flatten().to(X.device),xs.flatten().to(X.device)]
+            mosaic=src.to(device).float().T.reshape(1,shape[0],*img.shape)
             tiles.append(bank_to_pixels(bank,mosaic.flatten(1),vae))
             top5=torch.topk(attr["content"][0],5).indices
             colour=torch.full((*img.shape,3),0.5)

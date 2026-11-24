@@ -41,7 +41,8 @@ SETTINGS={
         "embed":f"{CELEBAHQ} --space pixel --resolution 64",
         "base":"google/ddpm-celebahq-256",
         "sample_size":64,
-        "train":"--batch_size 64 --max_steps 100000",
+        # gradient checkpointing: batch 64 runs out of memory on the 10.5GB GPUs
+        "train":"--batch_size 64 --gradient_checkpointing --max_steps 100000",
         # the 256px checkpoint as-is doesn't apply to 64px inputs
         "nets":["ft","scratch"],
     },
